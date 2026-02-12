@@ -1,0 +1,83 @@
+app: vjepa_drive
+
+folder: /logs/vjepa_drive/vitg16-256px-16f/
+
+data:
+  dataset_type: drivingvideodataset
+  datasets:
+    - /data/driving/nuscenes_clips.csv
+    - /data/driving/argoverse2_clips.csv
+    - /data/driving/waymo_clips.csv
+  datasets_weights: [0.34, 0.33, 0.33]
+  dataset_names: [nuscenes, argoverse, waymo]
+  batch_size: 6
+  crop_size: 256
+  dataset_fpcs: [16]
+  fps: 4
+  patch_size: 16
+  tubelet_size: 2
+  num_workers: 8
+  pin_mem: true
+  persistent_workers: true
+  trajectory_horizon: 12
+  trajectory_dt: 0.5
+
+data_aug:
+  random_resize_aspect_ratio: [0.75, 1.3333]
+  random_resize_scale: [0.3, 1.0]
+  motion_shift: false
+  reprob: 0.0
+  auto_augment: false
+
+model:
+  model_name: vit_giant_xformers
+  pred_depth: 12
+  pred_embed_dim: 384
+  pred_num_heads: 12
+  use_mask_tokens: true
+  use_rope: true
+  use_silu: false
+  wide_silu: true
+  compile_model: false
+  use_activation_checkpointing: false
+  trajectory_head:
+    num_waypoints: 12
+    waypoint_dim: 2
+    pooler_depth: 2
+    num_heads: 16
+    mlp_ratio: 4.0
+
+mask:
+  - spatial_scale: [0.15, 0.15]
+    temporal_scale: [1.0, 1.0]
+    aspect_ratio: [0.75, 1.5]
+    num_blocks: 8
+  - spatial_scale: [0.7, 0.7]
+    temporal_scale: [1.0, 1.0]
+    aspect_ratio: [0.75, 1.5]
+    num_blocks: 2
+
+loss:
+  loss_exp: 1.0
+  lambda_traj: 1.0
+
+optimization:
+  lr: 0.000525
+  start_lr: 0.0001
+  final_lr: 0.000001
+  weight_decay: 0.04
+  final_weight_decay: 0.04
+  warmup: 40
+  epochs: 50
+  ema: [0.99925, 0.99925]
+  ipe_scale: 1.0
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  encoder_lr_scale: 0.1
+
+meta:
+  dtype: bfloat16
+  use_sdpa: true
+  load_checkpoint: false
+  seed: 0
+  save_every_freq: 5
