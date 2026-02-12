@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""Prepare NVIDIA Physical AI AV dataset clips for V-JEPA2 driving training.
+
+Downloads a small number of clips from the NVIDIA Physical AI AV dataset
+on Hugging Face, extracts video files and ego-motion data, and creates
+a training CSV compatible with V-JEPA2's DrivingVideoDataset.
+
+Usage:
+    python scripts/prepare_nvidia_av_data.py
+
+Requires:
+    - physical_ai_av devkit installed (pip install -e physical_ai_av/)
+    - HuggingFace token at /localhome/local-samehm/.hugging_face_token
+"""
+
+import io
+import logging
+import os
+import pathlib
+import sys
+import zipfile
+
+import numpy as np
+import pandas as pd
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+HF_TOKEN_PATH = "/localhome/local-samehm/.hugging_face_token"
+PROJECT_ROOT = pathlib.Path("/localhome/local-samehm/vjepa2")
+DATA_ROOT = PROJECT_ROOT / "data" / "nvidia_av"
+VIDEO_DIR = DATA_ROOT / "videos"
+EGOMOTION_DIR = DATA_ROOT / "egomotion"
+TRAIN_CSV_PATH = DATA_ROOT / "train.csv"
+HF_CACHE_DIR = str(PROJECT_ROOT / "hf_cache")
+
+NUM_CLIPS = 5  # Download up to this many clips
+FEATURES_TO_DOWNLOAD = ["camera_front_wide_120fov", "egomotion"]
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stdout,
+)
+logger = logging.getLogger("prepare_nvidia_av_data")
+
+
+def read_hf_token(token_path: str) -> str:
+    """Read the HuggingFace token from a file."""
+    with open(token_path, "r") as f:
+        token = f.read().strip()
+    if not token:
+        raise ValueError(f"HuggingFace token file is empty: {token_path}")
+    logger.info("Successfully read HuggingFace token.")
+    return token
+
+
+def extract_video_bytes_from_zip(ds, clip_id: str, feature: str) -> bytes:
+    """Extract raw video bytes from the dataset's zip file.
+
+    Replicates the logic in dataset.get_clip_feature for camera features,
+    but returns the raw video bytes instead of constructing a SeekVideoReader.
+    This preserves the original encoding (lossless copy).
+    """
+    chunk_filename = ds.features.get_chunk_feature_filename(
+        ds.get_clip_chunk(clip_id), feature
+    )
+    clip_files_in_zip = ds.features.get_clip_files_in_zip(clip_id, feature)
+    with ds.open_file(chunk_filename) as f:
+        with zipfile.ZipFile(f, "r") as zf:
+            video_bytes = zf.read(clip_files_in_zip["video"])
+    return video_bytes
+
+
+def save_video(video_bytes: bytes, output_path: pathlib.Path) -> None:
+    """Save raw video bytes to an MP4 file."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "wb") as f:
+        f.write(video_bytes)
+    size_mb = len(video_bytes) / (1024 * 1024)
+    logger.info(f"  Saved video ({size_mb:.1f} MB): {output_path}")
+
+
+def extract_egomotion_csv(
+    ego_interpolator,
+    frame_timestamps: np.ndarray,
+    output_path: pathlib.Path,
+) -> pd.DataFrame:
+    """Interpolate ego-motion at frame timestamps and save to CSV.
+
+    Args:
+        ego_interpolator: Interpolator[EgomotionState] from the devkit.
+        frame_timestamps: Array of timestamps in microseconds (from video reader).
+        output_path: Where to write the ego-motion CSV.
+
+    Returns:
+        DataFrame with columns: timestamp, x, y, z, heading
+        (timestamp in seconds, heading = yaw in radians)
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Clamp frame timestamps to the interpolator's valid range
+    ego_t_min, ego_t_max = ego_interpolator.time_range
+    valid_mask = (frame_timestamps >= ego_t_min) & (frame_timestamps <= ego_t_max)
+    if not np.any(valid_mask):
+        raise ValueError(
+            f"No frame timestamps within ego-motion range "
+            f"[{ego_t_min}, {ego_t_max}]"
+        )
+    valid_timestamps = frame_timestamps[valid_mask]
+    logger.info(
+        f"  Using {len(valid_timestamps)}/{len(frame_timestamps)} frame timestamps "
+        f"within ego-motion range."
+    )
+
+    # Interpolate ego-motion at valid frame timestamps
+    ego_states = ego_interpolator(valid_timestamps)
+
+    # Extract position (x, y, z)
+    positions = ego_states.pose.translation  # shape (N, 3)
+
+    # Extract heading (yaw) from rotation using ZYX Euler angles
+    # .as_euler('ZYX') returns [yaw, pitch, roll] per row
+    euler_angles = ego_states.pose.rotation.as_euler("ZYX")
+    yaw = euler_angles[:, 0]  # first column is yaw (Z-axis rotation)
+
+    # Convert timestamps from microseconds to seconds
+    timestamps_sec = valid_timestamps / 1e6
+
+    # Build DataFrame
+    df = pd.DataFrame(
+        {
+            "timestamp": timestamps_sec,
+            "x": positions[:, 0],
+            "y": positions[:, 1],
+            "z": positions[:, 2],
+            "heading": yaw,
+        }
+    )
+    df.to_csv(output_path, index=False)
+    logger.info(f"  Saved ego-motion CSV ({len(df)} rows): {output_path}")
+    return df
+
+
+def main():
+    logger.info("=" * 70)
+    logger.info("NVIDIA Physical AI AV Data Preparation for V-JEPA2")
+    logger.info("=" * 70)
+
+    # ------------------------------------------------------------------
+    # Step 1: Read HuggingFace token
+    # ------------------------------------------------------------------
+    logger.info("Step 1: Reading HuggingFace token...")
+    token = read_hf_token(HF_TOKEN_PATH)
+
+    # ------------------------------------------------------------------
+    # Step 2: Initialize the dataset interface
+    # ------------------------------------------------------------------
+    logger.info("Step 2: Initializing PhysicalAIAVDatasetInterface...")
+    from physical_ai_av import PhysicalAIAVDatasetInterface
+
+    ds = PhysicalAIAVDatasetInterface(
+        token=token,
+        cache_dir=HF_CACHE_DIR,
+        confirm_download_threshold_gb=float("inf"),
+    )
+    logger.info(f"  Dataset interface initialized: {ds}")
+
+    # ------------------------------------------------------------------
+    # Step 3: List available clips and select a subset
+    # ------------------------------------------------------------------
+    logger.info("Step 3: Listing available clips...")
+    all_clip_ids = ds.clip_index.index.tolist()
+    logger.info(f"  Total clips available: {len(all_clip_ids)}")
+
+    # Select the first NUM_CLIPS clips
+    selected_clip_ids = all_clip_ids[:NUM_CLIPS]
+    logger.info(f"  Selected {len(selected_clip_ids)} clips: {selected_clip_ids}")
+
+    # ------------------------------------------------------------------
+    # Step 4: Create output directories
+    # ------------------------------------------------------------------
+    logger.info("Step 4: Creating output directories...")
+    VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+    EGOMOTION_DIR.mkdir(parents=True, exist_ok=True)
+    logger.info(f"  Video dir:     {VIDEO_DIR}")
+    logger.info(f"  Egomotion dir: {EGOMOTION_DIR}")
+
+    # ------------------------------------------------------------------
+    # Step 5: Download and process clips
+    # ------------------------------------------------------------------
+    logger.info("Step 5: Downloading and processing clips...")
+    train_rows = []
+    successful_clips = 0
+
+    for i, clip_id in enumerate(selected_clip_ids):
+        logger.info(f"\n--- Clip {i + 1}/{len(selected_clip_ids)}: {clip_id} ---")
+
+        try:
+            # Download the clip features (camera + egomotion)
+            logger.info(f"  Downloading features: {FEATURES_TO_DOWNLOAD}")
+            ds.download_clip_features(
+                clip_id=clip_id,
+                features=FEATURES_TO_DOWNLOAD,
+            )
+            logger.info("  Download complete.")
+
+            # Extract and save the video
+            logger.info("  Extracting video bytes from zip...")
+            video_bytes = extract_video_bytes_from_zip(
+                ds, clip_id, "camera_front_wide_120fov"
+            )
+            video_path = VIDEO_DIR / f"{clip_id}.mp4"
+            save_video(video_bytes, video_path)
+
+            # Get video reader (for timestamps)
+            logger.info("  Getting video reader for frame timestamps...")
+            video_reader = ds.get_clip_feature(clip_id, "camera_front_wide_120fov")
+            frame_timestamps = video_reader.timestamps  # microseconds
+            logger.info(
+                f"  Frame timestamps: {len(frame_timestamps)} frames, "
+                f"range [{frame_timestamps[0]}, {frame_timestamps[-1]}] us"
+            )
+            # Close the video reader to free resources
+            video_reader.close()
+
+            # Get ego-motion interpolator
+            logger.info("  Getting ego-motion interpolator...")
+            ego_interp = ds.get_clip_feature(clip_id, "egomotion")
+            logger.info(f"  Ego-motion interpolator: {ego_interp}")
+
+            # Extract ego-motion at frame timestamps and save CSV
+            logger.info("  Interpolating ego-motion at frame timestamps...")
+            ego_csv_path = EGOMOTION_DIR / f"{clip_id}.csv"
+            ego_df = extract_egomotion_csv(
+                ego_interp, frame_timestamps, ego_csv_path
+            )
+
+            # Build training CSV row
+            # clip_start_time and clip_end_time are the first and last
+            # ego-motion timestamps in seconds
+            clip_start_time = ego_df["timestamp"].iloc[0]
+            clip_end_time = ego_df["timestamp"].iloc[-1]
+
+            train_rows.append(
+                {
+                    "video_path": str(video_path),
+                    "ego_motion_path": str(ego_csv_path),
+                    "clip_start_time": f"{clip_start_time:.6f}",
+                    "clip_end_time": f"{clip_end_time:.6f}",
+                    "dataset_name": "nvidia_av",
+                }
+            )
+
+            successful_clips += 1
+            logger.info(
+                f"  Successfully processed clip {clip_id} "
+                f"(start={clip_start_time:.3f}s, end={clip_end_time:.3f}s)"
+            )
+
+        except Exception as e:
+            logger.error(f"  FAILED to process clip {clip_id}: {e}", exc_info=True)
+            logger.info("  Skipping this clip and continuing...")
+            continue
+
+    # ------------------------------------------------------------------
+    # Step 6: Create training CSV
+    # ------------------------------------------------------------------
+    logger.info(f"\nStep 6: Creating training CSV at {TRAIN_CSV_PATH}")
+
+    if not train_rows:
+        logger.error("No clips were successfully processed. No training CSV created.")
+        sys.exit(1)
+
+    # Write space-delimited CSV without header (as expected by DrivingVideoDataset)
+    with open(TRAIN_CSV_PATH, "w") as f:
+        for row in train_rows:
+            line = " ".join(
+                [
+                    row["video_path"],
+                    row["ego_motion_path"],
+                    row["clip_start_time"],
+                    row["clip_end_time"],
+                    row["dataset_name"],
+                ]
+            )
+            f.write(line + "\n")
+
+    logger.info(f"  Training CSV written with {len(train_rows)} entries.")
+
+    # ------------------------------------------------------------------
+    # Summary
+    # ------------------------------------------------------------------
+    logger.info("\n" + "=" * 70)
+    logger.info("SUMMARY")
+    logger.info("=" * 70)
+    logger.info(f"  Clips attempted:  {len(selected_clip_ids)}")
+    logger.info(f"  Clips succeeded:  {successful_clips}")
+    logger.info(f"  Clips failed:     {len(selected_clip_ids) - successful_clips}")
+    logger.info(f"  Video directory:  {VIDEO_DIR}")
+    logger.info(f"  Egomotion dir:    {EGOMOTION_DIR}")
+    logger.info(f"  Training CSV:     {TRAIN_CSV_PATH}")
+    logger.info("=" * 70)
+
+    # Verify output
+    logger.info("\nVerification:")
+    video_files = list(VIDEO_DIR.glob("*.mp4"))
+    ego_files = list(EGOMOTION_DIR.glob("*.csv"))
+    logger.info(f"  Video files:   {len(video_files)}")
+    logger.info(f"  Ego CSV files: {len(ego_files)}")
+    logger.info(f"  Train CSV exists: {TRAIN_CSV_PATH.exists()}")
+
+    if TRAIN_CSV_PATH.exists():
+        logger.info(f"\n  Training CSV contents:")
+        with open(TRAIN_CSV_PATH, "r") as f:
+            for line in f:
+                logger.info(f"    {line.rstrip()}")
+
+    logger.info("\nDone.")
+
+
+if __name__ == "__main__":
+    main()

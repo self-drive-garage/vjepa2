@@ -1,0 +1,77 @@
+app: vjepa_drive
+
+folder: /logs/vjepa_drive/debug-phase1-tiny/
+
+data:
+  dataset_type: drivingvideodataset
+  datasets:
+    - /localhome/local-samehm/vjepa2/data/nvidia_av/train.csv
+  dataset_names: [nvidia_av]
+  datasets_weights: [1.0]
+  batch_size: 1
+  crop_size: 64
+  dataset_fpcs: [2]
+  fps: 2
+  patch_size: 16
+  tubelet_size: 2
+  num_workers: 0
+  pin_mem: false
+  persistent_workers: false
+  trajectory_horizon: 2
+  trajectory_dt: 0.5
+
+data_aug:
+  random_resize_aspect_ratio: [0.9, 1.1]
+  random_resize_scale: [0.8, 1.0]
+  motion_shift: false
+  reprob: 0.0
+  auto_augment: false
+
+model:
+  model_name: vit_micro
+  pred_depth: 2
+  pred_embed_dim: 96
+  pred_num_heads: 3
+  use_mask_tokens: true
+  use_rope: false
+  use_silu: false
+  wide_silu: false
+  compile_model: false
+  use_activation_checkpointing: false
+  trajectory_head:
+    num_waypoints: 2
+    waypoint_dim: 2
+    pooler_depth: 1
+    num_heads: 2
+    mlp_ratio: 2.0
+
+mask:
+  - spatial_scale: [0.4, 0.4]
+    temporal_scale: [1.0, 1.0]
+    aspect_ratio: [0.75, 1.5]
+    num_blocks: 4
+
+loss:
+  loss_exp: 1.0
+  lambda_traj: 1.0
+
+optimization:
+  lr: 0.0005
+  start_lr: 0.0001
+  final_lr: 0.00005
+  weight_decay: 0.01
+  final_weight_decay: 0.01
+  warmup: 1
+  epochs: 2
+  ema: [0.99, 0.99]
+  ipe_scale: 1.0
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  encoder_lr_scale: 0.5
+
+meta:
+  dtype: float32
+  use_sdpa: false
+  load_checkpoint: false
+  seed: 0
+  save_every_freq: 5

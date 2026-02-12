@@ -113,6 +113,26 @@ V-JEPA 2 is a self-supervised approach to training video encoders, using interne
 
 ## Models
 
+## Phase 1 Autonomous-Driving Training
+
+The `scripts/run_phase1_training.sh` helper wraps `app/main.py` so you can rapidly alternate between the production Phase 1 recipe (`configs/train/vitg16/driving-joint-256px-16f.yaml`) and lightweight smoke tests.
+
+```
+# Full multi-GPU run on real data (no synthetic video)
+./scripts/run_phase1_training.sh \
+    --config configs/train/vitg16/driving-joint-256px-16f.yaml \
+    --gpus 0,1,2,3 \
+    --datasets nuscenes:/abs/path/nuscenes.csv,waymo:/abs/path/waymo.csv \
+    --pretrained /abs/path/vitg.pt \
+    --num-workers 8
+```
+
+- `--num-workers` throttles the DataLoader for small dev rigs (set it to `0` if `/dev/shm` is restricted or you need deterministic CPU-only debugging).
+- `--config` can point at the included `configs/train/debug-phase1-tiny.yaml` to run a ~5 second CPU verification loop (`./scripts/run_phase1_training.sh --config configs/train/debug-phase1-tiny.yaml --gpus cpu --num-workers 0`). This uses the micro ViT head so you can validate losses/logging without touching CUDA.
+- Keep `VJEPA_FAKE_VIDEO` **unset** for all production runs; the temporary synthetic-video shortcut has been removed so end-to-end jobs always read the real driving datasets.
+
+The script re-materializes a run-specific YAML in `logs/vjepa_drive/<run-name>/phase1_config.yaml`, records the exact arguments in `params-pretrain.yaml`, and emits checkpoints every `save_every_freq` epochs (5 epochs for the debug config, 5 epochs for the full recipe by default).
+
 ### V-JEPA 2
 
 #### HuggingFace

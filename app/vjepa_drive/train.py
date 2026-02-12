@@ -338,10 +338,13 @@ def main(args, resume_preempt=False):
         eps=eps,
         encoder_lr_scale=encoder_lr_scale,
     )
-    encoder = DistributedDataParallel(encoder, static_graph=True)
-    predictor = DistributedDataParallel(predictor, static_graph=False, find_unused_parameters=True)
-    trajectory_head = DistributedDataParallel(trajectory_head, static_graph=True)
-    target_encoder = DistributedDataParallel(target_encoder)
+    if torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        encoder = DistributedDataParallel(encoder, static_graph=True)
+        predictor = DistributedDataParallel(predictor, static_graph=False, find_unused_parameters=True)
+        trajectory_head = DistributedDataParallel(trajectory_head, static_graph=True)
+        target_encoder = DistributedDataParallel(target_encoder)
+    else:
+        logger.info("Distributed process group not initialized; running in single-process mode.")
     for p in target_encoder.parameters():
         p.requires_grad = False
 

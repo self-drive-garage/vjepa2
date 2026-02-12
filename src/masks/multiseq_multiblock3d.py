@@ -6,11 +6,23 @@
 import math
 from logging import getLogger
 from multiprocessing import Value
+from threading import Lock
 
 import torch
 
 _GLOBAL_SEED = 0
 logger = getLogger()
+
+
+class _LocalCounter:
+    """Fallback counter when shared memory Values cannot be created."""
+
+    def __init__(self, initial=-1):
+        self.value = initial
+        self._lock = Lock()
+
+    def get_lock(self):
+        return self._lock
 
 
 class MaskCollator(object):
@@ -116,7 +128,13 @@ class _MaskGenerator(object):
             1, int(self.duration * max_context_frames_ratio)
         )  # maximum number of time-steps (frames) spanned by context mask
         self.max_keep = max_keep  # maximum number of patches to keep in context
-        self._itr_counter = Value("i", -1)  # collator is shared across worker processes
+        try:
+            self._itr_counter = Value("i", -1)  # collator is shared across worker processes
+        except (OSError, PermissionError) as exc:
+            logger.warning(
+                "Falling back to local counter for mask generator due to shared memory error: %s", exc
+            )
+            self._itr_counter = _LocalCounter(-1)
         self.inv_block = inv_block
 
     def step(self):
