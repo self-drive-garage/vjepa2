@@ -10,7 +10,7 @@ data:
     - /data/driving/waymo_clips.csv
   datasets_weights: [0.34, 0.33, 0.33]
   dataset_names: [nuscenes, argoverse, waymo]
-  batch_size: 6
+  batch_size: 3
   crop_size: 256
   dataset_fpcs: [16]
   fps: 4
@@ -39,7 +39,7 @@ model:
   use_silu: false
   wide_silu: true
   compile_model: false
-  use_activation_checkpointing: false
+  use_activation_checkpointing: true
   trajectory_head:
     num_waypoints: 12
     waypoint_dim: 2
