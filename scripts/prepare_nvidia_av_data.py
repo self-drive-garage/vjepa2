@@ -47,6 +47,7 @@ FEATURES_TO_DOWNLOAD = ["camera_front_wide_120fov", "egomotion"]
 DEFAULT_BYTES_PER_CLIP = int(float(os.environ.get("VJEPA_BYTES_PER_CLIP_MB", "25")) * 1024 * 1024)
 DISK_RESERVE_GB = float(os.environ.get("VJEPA_DISK_RESERVE_GB", "50"))
 MAX_CLIPS_CAP = int(os.environ.get("VJEPA_MAX_CLIPS", "10000"))
+MAX_SAMPLES_CAP = int(os.environ.get("VJEPA_MAX_SAMPLES", "30000"))
 CLIP_STRIDE_SEC = float(os.environ.get("VJEPA_CLIP_STRIDE_SEC", "1.0"))
 MAX_WINDOWS_PER_CLIP = int(os.environ.get("VJEPA_MAX_WINDOWS_PER_CLIP", "0"))
 
@@ -344,11 +345,21 @@ def main():
     # ------------------------------------------------------------------
     logger.info("Step 5: Downloading and processing clips...")
     train_row_map = load_existing_train_rows(TRAIN_CSV_PATH)
+    if len(train_row_map) >= MAX_SAMPLES_CAP:
+        logger.info(
+            "Existing CSV already has %d rows (>= sample cap %d). Rewriting and exiting.",
+            len(train_row_map),
+            MAX_SAMPLES_CAP,
+        )
     successful_clips = 0
     generated_samples = 0
     reused_local_assets = 0
 
     for i, clip_id in enumerate(selected_clip_ids):
+        if len(train_row_map) >= MAX_SAMPLES_CAP:
+            logger.info("Reached sample cap (%d). Stopping early.", MAX_SAMPLES_CAP)
+            break
+
         logger.info(f"\n--- Clip {i + 1}/{len(selected_clip_ids)}: {clip_id} ---")
 
         try:
@@ -428,6 +439,18 @@ def main():
                 ego_end,
             )
 
+            remaining = MAX_SAMPLES_CAP - len(train_row_map)
+            if remaining <= 0:
+                logger.info("  No sample budget remaining. Skipping window writes.")
+                break
+            if len(clip_windows) > remaining:
+                logger.info(
+                    "  Truncating clip windows from %d to %d to honor sample cap.",
+                    len(clip_windows),
+                    remaining,
+                )
+                clip_windows = clip_windows[:remaining]
+
             for clip_start_time, clip_end_time in clip_windows:
                 row_id = make_row_id(clip_id, clip_start_time, clip_end_time)
                 train_row_map[row_id] = {
@@ -486,6 +509,7 @@ def main():
     logger.info(f"  Clips succeeded (this run):  {successful_clips}")
     logger.info(f"  Clips reused local assets:   {reused_local_assets}")
     logger.info(f"  Samples generated (this run): {generated_samples}")
+    logger.info(f"  Sample cap:                 {MAX_SAMPLES_CAP}")
     logger.info(
         "  Clips failed (this run):     %d",
         len(selected_clip_ids) - successful_clips,
