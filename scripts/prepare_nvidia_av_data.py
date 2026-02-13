@@ -47,6 +47,8 @@ FEATURES_TO_DOWNLOAD = ["camera_front_wide_120fov", "egomotion"]
 DEFAULT_BYTES_PER_CLIP = int(float(os.environ.get("VJEPA_BYTES_PER_CLIP_MB", "25")) * 1024 * 1024)
 DISK_RESERVE_GB = float(os.environ.get("VJEPA_DISK_RESERVE_GB", "50"))
 MAX_CLIPS_CAP = int(os.environ.get("VJEPA_MAX_CLIPS", "10000"))
+CLIP_STRIDE_SEC = float(os.environ.get("VJEPA_CLIP_STRIDE_SEC", "1.0"))
+MAX_WINDOWS_PER_CLIP = int(os.environ.get("VJEPA_MAX_WINDOWS_PER_CLIP", "0"))
 
 # Clip metadata derived from configs/train/vitg16/driving-joint-256px-16f.yaml:
 #   frames_per_clip=16 sampled at 4 fps => 4-second video windows.
@@ -138,8 +140,11 @@ def save_video(video_bytes: bytes, output_path: pathlib.Path) -> None:
     logger.info(f"  Saved video ({size_mb:.1f} MB): {output_path}")
 
 
-def select_clip_window_from_ego_df(ego_df: pd.DataFrame, clip_id: str) -> tuple[float, float, float, float]:
-    """Compute clip start/end times from ego-motion samples."""
+def select_clip_windows_from_ego_df(
+    ego_df: pd.DataFrame,
+    clip_id: str,
+) -> tuple[list[tuple[float, float]], float, float]:
+    """Compute one or more valid clip windows from ego-motion samples."""
     ego_start = float(ego_df["timestamp"].iloc[0])
     ego_end = float(ego_df["timestamp"].iloc[-1])
     available = ego_end - ego_start
@@ -149,21 +154,28 @@ def select_clip_window_from_ego_df(ego_df: pd.DataFrame, clip_id: str) -> tuple[
             f"insufficient duration for clip {clip_id}: available={available:.3f}s < required={required:.3f}s"
         )
 
-    clip_start_time = ego_start + FUTURE_MARGIN_SEC
-    clip_end_time = clip_start_time + CLIP_DURATION_SEC
-
-    max_end_time = ego_end - FUTURE_MARGIN_SEC
-    if clip_end_time > max_end_time:
-        shift = clip_end_time - max_end_time
-        clip_end_time -= shift
-        clip_start_time -= shift
-
-    if clip_start_time < ego_start:
+    min_start_time = ego_start + FUTURE_MARGIN_SEC
+    max_start_time = ego_end - FUTURE_MARGIN_SEC - CLIP_DURATION_SEC
+    if max_start_time < min_start_time:
         raise ValueError(
-            f"cannot satisfy future margin for clip {clip_id}: start={clip_start_time:.3f}s < ego_start={ego_start:.3f}s"
+            f"cannot satisfy clip+future margin for clip {clip_id}: "
+            f"min_start={min_start_time:.3f}s max_start={max_start_time:.3f}s"
         )
 
-    return clip_start_time, clip_end_time, ego_start, ego_end
+    starts = np.arange(min_start_time, max_start_time + 1e-6, CLIP_STRIDE_SEC, dtype=np.float64)
+    if starts.size == 0:
+        starts = np.array([min_start_time], dtype=np.float64)
+    elif abs(starts[-1] - max_start_time) > 1e-3:
+        starts = np.append(starts, max_start_time)
+
+    windows = [(float(s), float(s + CLIP_DURATION_SEC)) for s in starts]
+    if MAX_WINDOWS_PER_CLIP > 0:
+        windows = windows[:MAX_WINDOWS_PER_CLIP]
+    return windows, ego_start, ego_end
+
+
+def make_row_id(clip_id: str, clip_start_time: float, clip_end_time: float) -> str:
+    return f"{clip_id}:{clip_start_time:.6f}:{clip_end_time:.6f}"
 
 
 def load_existing_train_rows(train_csv_path: pathlib.Path) -> OrderedDict[str, dict[str, str]]:
@@ -182,12 +194,15 @@ def load_existing_train_rows(train_csv_path: pathlib.Path) -> OrderedDict[str, d
                 continue
             video_path, ego_path, clip_start, clip_end, dataset_name = parts
             clip_id = pathlib.Path(video_path).stem
-            rows[clip_id] = {
+            clip_start_f = float(clip_start)
+            clip_end_f = float(clip_end)
+            rows[make_row_id(clip_id, clip_start_f, clip_end_f)] = {
                 "video_path": video_path,
                 "ego_motion_path": ego_path,
-                "clip_start_time": clip_start,
-                "clip_end_time": clip_end,
+                "clip_start_time": f"{clip_start_f:.6f}",
+                "clip_end_time": f"{clip_end_f:.6f}",
                 "dataset_name": dataset_name,
+                "clip_id": clip_id,
             }
     logger.info(
         "Loaded %d existing training entries from %s.",
@@ -330,7 +345,8 @@ def main():
     logger.info("Step 5: Downloading and processing clips...")
     train_row_map = load_existing_train_rows(TRAIN_CSV_PATH)
     successful_clips = 0
-    skipped_existing_clips = 0
+    generated_samples = 0
+    reused_local_assets = 0
 
     for i, clip_id in enumerate(selected_clip_ids):
         logger.info(f"\n--- Clip {i + 1}/{len(selected_clip_ids)}: {clip_id} ---")
@@ -339,69 +355,65 @@ def main():
             video_path = VIDEO_DIR / f"{clip_id}.mp4"
             ego_csv_path = EGOMOTION_DIR / f"{clip_id}.csv"
 
-            existing_row = train_row_map.get(clip_id)
             video_exists = video_path.exists()
             ego_exists = ego_csv_path.exists()
-            if existing_row and video_exists and ego_exists:
-                logger.info(
-                    "  Clip already processed with existing assets. Skipping heavy work."
-                )
-                skipped_existing_clips += 1
-                continue
-            if existing_row:
-                logger.warning(
-                    "  Existing training entry for %s lacks files. Reprocessing clip.", clip_id
-                )
-                train_row_map.pop(clip_id, None)
-
-            missing_features = [
-                feature
-                for feature in FEATURES_TO_DOWNLOAD
-                if not feature_zip_cached(ds, clip_id, feature)
+            existing_row_keys = [
+                row_id
+                for row_id, row in train_row_map.items()
+                if row.get("clip_id", pathlib.Path(row["video_path"]).stem) == clip_id
             ]
-            if missing_features:
-                logger.info("  Downloading missing features: %s", missing_features)
-                ds.download_clip_features(
-                    clip_id=clip_id,
-                    features=missing_features,
-                )
-                logger.info("  Download complete.")
+            for row_id in existing_row_keys:
+                train_row_map.pop(row_id, None)
+            if video_exists and ego_exists:
+                logger.info("  Local video + ego CSV found. Skipping download and extraction.")
+                reused_local_assets += 1
             else:
-                logger.info("  All requested features already cached. Skipping download.")
+                missing_features = [
+                    feature
+                    for feature in FEATURES_TO_DOWNLOAD
+                    if not feature_zip_cached(ds, clip_id, feature)
+                ]
+                if missing_features:
+                    logger.info("  Downloading missing features: %s", missing_features)
+                    ds.download_clip_features(
+                        clip_id=clip_id,
+                        features=missing_features,
+                    )
+                    logger.info("  Download complete.")
+                else:
+                    logger.info("  All requested features already cached. Skipping download.")
 
-            if video_exists:
-                logger.info("  Video already exists. Skipping extraction: %s", video_path)
-            else:
-                logger.info("  Extracting video bytes from zip...")
-                video_bytes = extract_video_bytes_from_zip(
-                    ds, clip_id, "camera_front_wide_120fov"
-                )
-                save_video(video_bytes, video_path)
-
-            # Get video reader (for timestamps)
-            logger.info("  Getting video reader for frame timestamps...")
-            video_reader = ds.get_clip_feature(clip_id, "camera_front_wide_120fov")
-            frame_timestamps = video_reader.timestamps  # microseconds
-            logger.info(
-                f"  Frame timestamps: {len(frame_timestamps)} frames, "
-                f"range [{frame_timestamps[0]}, {frame_timestamps[-1]}] us"
-            )
-            # Close the video reader to free resources
-            video_reader.close()
-
-            # Get ego-motion interpolator
-            logger.info("  Getting ego-motion interpolator...")
-            ego_interp = ds.get_clip_feature(clip_id, "egomotion")
-            logger.info(f"  Ego-motion interpolator: {ego_interp}")
+                if video_exists:
+                    logger.info("  Video already exists. Skipping extraction: %s", video_path)
+                else:
+                    logger.info("  Extracting video bytes from zip...")
+                    video_bytes = extract_video_bytes_from_zip(
+                        ds, clip_id, "camera_front_wide_120fov"
+                    )
+                    save_video(video_bytes, video_path)
 
             # Extract ego-motion at frame timestamps and save CSV
-            logger.info("  Interpolating ego-motion at frame timestamps...")
-            ego_df = extract_egomotion_csv(
-                ego_interp, frame_timestamps, ego_csv_path
-            )
+            if ego_exists:
+                logger.info("  Ego-motion CSV already exists. Reusing: %s", ego_csv_path)
+                ego_df = pd.read_csv(ego_csv_path)
+            else:
+                logger.info("  Getting video reader for frame timestamps...")
+                video_reader = ds.get_clip_feature(clip_id, "camera_front_wide_120fov")
+                frame_timestamps = video_reader.timestamps  # microseconds
+                logger.info(
+                    f"  Frame timestamps: {len(frame_timestamps)} frames, "
+                    f"range [{frame_timestamps[0]}, {frame_timestamps[-1]}] us"
+                )
+                video_reader.close()
+                logger.info("  Getting ego-motion interpolator...")
+                ego_interp = ds.get_clip_feature(clip_id, "egomotion")
+                logger.info("  Interpolating ego-motion at frame timestamps...")
+                ego_df = extract_egomotion_csv(
+                    ego_interp, frame_timestamps, ego_csv_path
+                )
 
             try:
-                clip_start_time, clip_end_time, ego_start, ego_end = select_clip_window_from_ego_df(
+                clip_windows, ego_start, ego_end = select_clip_windows_from_ego_df(
                     ego_df, clip_id
                 )
             except ValueError as exc:
@@ -409,25 +421,29 @@ def main():
                 continue
 
             logger.info(
-                "  Clip window selected: start=%.3fs end=%.3fs (ego span %.3fs-%.3fs)",
-                clip_start_time,
-                clip_end_time,
+                "  Generated %d training windows (stride %.2fs, ego span %.3fs-%.3fs)",
+                len(clip_windows),
+                CLIP_STRIDE_SEC,
                 ego_start,
                 ego_end,
             )
 
-            train_row_map[clip_id] = {
-                "video_path": str(video_path),
-                "ego_motion_path": str(ego_csv_path),
-                "clip_start_time": f"{clip_start_time:.6f}",
-                "clip_end_time": f"{clip_end_time:.6f}",
-                "dataset_name": "nvidia_av",
-            }
+            for clip_start_time, clip_end_time in clip_windows:
+                row_id = make_row_id(clip_id, clip_start_time, clip_end_time)
+                train_row_map[row_id] = {
+                    "video_path": str(video_path),
+                    "ego_motion_path": str(ego_csv_path),
+                    "clip_start_time": f"{clip_start_time:.6f}",
+                    "clip_end_time": f"{clip_end_time:.6f}",
+                    "dataset_name": "nvidia_av",
+                    "clip_id": clip_id,
+                }
+            generated_samples += len(clip_windows)
 
             successful_clips += 1
             logger.info(
                 f"  Successfully processed clip {clip_id} "
-                f"(start={clip_start_time:.3f}s, end={clip_end_time:.3f}s)"
+                f"({len(clip_windows)} windows)"
             )
 
         except Exception as e:
@@ -468,10 +484,11 @@ def main():
     logger.info("=" * 70)
     logger.info(f"  Clips attempted:  {len(selected_clip_ids)}")
     logger.info(f"  Clips succeeded (this run):  {successful_clips}")
-    logger.info(f"  Clips skipped (existing):    {skipped_existing_clips}")
+    logger.info(f"  Clips reused local assets:   {reused_local_assets}")
+    logger.info(f"  Samples generated (this run): {generated_samples}")
     logger.info(
         "  Clips failed (this run):     %d",
-        len(selected_clip_ids) - successful_clips - skipped_existing_clips,
+        len(selected_clip_ids) - successful_clips,
     )
     logger.info(f"  Video directory:  {VIDEO_DIR}")
     logger.info(f"  Egomotion dir:    {EGOMOTION_DIR}")

@@ -252,8 +252,10 @@ class DrivingVideoDataset(torch.utils.data.Dataset):
         dataset_idx, _ = self.per_dataset_indices[index]
         frames_per_clip = self.dataset_fpcs[dataset_idx]
 
-        # Load video frames
-        buffer, clip_indices = self._loadvideo_decord(sample["video_path"], frames_per_clip)
+        # Load video frames and the sampled clip end time used for trajectory supervision.
+        buffer, clip_indices, sampled_clip_end_time = self._loadvideo_decord(
+            sample["video_path"], frames_per_clip, sample
+        )
         if len(buffer) == 0:
             return None
 
@@ -265,7 +267,8 @@ class DrivingVideoDataset(torch.utils.data.Dataset):
                 timestamps=timestamps,
                 positions=positions,
                 headings=headings,
-                ref_timestamp=sample["clip_end_time"],
+                # Keep trajectory target aligned with the actual sampled video frames.
+                ref_timestamp=sampled_clip_end_time,
                 horizon=self.trajectory_horizon,
                 dt=self.trajectory_dt,
             )
@@ -289,44 +292,72 @@ class DrivingVideoDataset(torch.utils.data.Dataset):
 
         return buffer, gt_trajectory, clip_indices
 
-    def _loadvideo_decord(self, fname, fpc):
+    def _loadvideo_decord(self, fname, fpc, sample=None):
         """Load video using Decord (mirrors VideoDataset.loadvideo_decord)."""
         if not os.path.exists(fname):
             warnings.warn(f"video path not found {fname=}")
-            return [], None
+            return [], None, None
 
         _fsize = os.path.getsize(fname)
         if _fsize > self.filter_long_videos:
             warnings.warn(f"skipping long video of size {_fsize=} (bytes)")
-            return [], None
+            return [], None, None
 
         try:
             vr = VideoReader(fname, num_threads=-1, ctx=cpu(0))
         except Exception:
-            return [], None
+            return [], None, None
+
+        try:
+            video_fps = float(vr.get_avg_fps())
+            if video_fps <= 0:
+                raise ValueError(f"Invalid FPS {video_fps}")
+        except Exception as e:
+            logger.warning(e)
+            return [], None, None
 
         fstp = self.frame_step
         if self.duration is not None or self.fps is not None:
-            try:
-                video_fps = math.ceil(vr.get_avg_fps())
-            except Exception as e:
-                logger.warning(e)
-                return [], None
-
             if self.duration is not None:
                 fstp = int(self.duration * video_fps / fpc)
             else:
-                fstp = video_fps // self.fps
+                fstp = int(math.ceil(video_fps / self.fps))
 
         if fstp is None or fstp <= 0:
-            return [], None
+            return [], None, None
         clip_len = int(fpc * fstp)
 
         if self.filter_short_videos and len(vr) < clip_len:
             warnings.warn(f"skipping video of length {len(vr)}")
-            return [], None
+            return [], None, None
 
         vr.seek(0)
+
+        # If CSV provides a clip window, prioritize deterministic time alignment.
+        # This keeps video frames and trajectory targets synchronized.
+        if (
+            sample is not None
+            and self.num_clips == 1
+            and "clip_start_time" in sample
+            and "clip_end_time" in sample
+        ):
+            clip_start_sec = float(sample["clip_start_time"])
+            clip_end_sec = float(sample["clip_end_time"])
+            if clip_end_sec > clip_start_sec:
+                max_frame_idx = max(len(vr) - 1, 0)
+                start_idx = int(round(clip_start_sec * video_fps))
+                end_idx = int(round(clip_end_sec * video_fps)) - 1
+                start_idx = int(np.clip(start_idx, 0, max_frame_idx))
+                end_idx = int(np.clip(max(end_idx, start_idx), start_idx, max_frame_idx))
+                if end_idx == start_idx:
+                    indices = np.full((fpc,), start_idx, dtype=np.int64)
+                else:
+                    indices = np.linspace(start_idx, end_idx, num=fpc)
+                    indices = np.clip(np.round(indices), start_idx, end_idx).astype(np.int64)
+                clip_indices = [indices]
+                buffer = vr.get_batch(indices.tolist()).asnumpy()
+                sampled_clip_end_time = float(indices[-1]) / video_fps
+                return buffer, clip_indices, sampled_clip_end_time
 
         partition_len = len(vr) // self.num_clips
         all_indices, clip_indices = [], []
@@ -365,7 +396,8 @@ class DrivingVideoDataset(torch.utils.data.Dataset):
             all_indices.extend(list(indices))
 
         buffer = vr.get_batch(all_indices).asnumpy()
-        return buffer, clip_indices
+        sampled_clip_end_time = float(clip_indices[-1][-1]) / video_fps
+        return buffer, clip_indices, sampled_clip_end_time
 
     def __len__(self):
         return len(self.samples)

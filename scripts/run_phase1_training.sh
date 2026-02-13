@@ -16,8 +16,11 @@ Options:
   -g, --gpus LIST            Comma-separated GPU identifiers (e.g. 0,1 or cuda:0,cuda:1; default: 0)
   -d, --datasets SPECS       Comma-separated dataset specs name:path (default: nvidia_av:<repo>/data/nvidia_av/train.csv)
   -p, --pretrained CKPT      Path to pretrained V-JEPA2 checkpoint to initialize from
+  -e, --epochs N             Override total training epochs in config
   -b, --batch-size N         Override batch size in config
   -w, --num-workers N        Override DataLoader worker count (disables pin_mem when set)
+  --backend NAME            Distributed backend (nccl|gloo|mpi); default respects
+                            $TORCH_DISTRIBUTED_BACKEND or falls back to gloo.
   -h, --help                 Show this message and exit
 
 Examples:
@@ -37,8 +40,10 @@ RUN_NAME="phase1-$(date +%Y%m%d-%H%M%S)"
 GPU_STRING="0"
 DATASET_SPECS="nvidia_av:${PROJECT_ROOT}/data/nvidia_av/train.csv"
 PRETRAIN_CKPT=""
+EPOCHS_OVERRIDE=""
 BATCH_SIZE_OVERRIDE=""
 NUM_WORKERS_OVERRIDE=""
+DIST_BACKEND="${TORCH_DISTRIBUTED_BACKEND:-gloo}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -66,12 +71,20 @@ while [[ $# -gt 0 ]]; do
             PRETRAIN_CKPT="$(realpath "$2")"
             shift 2
             ;;
+        -e|--epochs)
+            EPOCHS_OVERRIDE="$2"
+            shift 2
+            ;;
         -b|--batch-size)
             BATCH_SIZE_OVERRIDE="$2"
             shift 2
             ;;
         -w|--num-workers)
             NUM_WORKERS_OVERRIDE="$2"
+            shift 2
+            ;;
+        --backend)
+            DIST_BACKEND="$2"
             shift 2
             ;;
         -h|--help)
@@ -85,6 +98,17 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+DIST_BACKEND="${DIST_BACKEND:-gloo}"
+DIST_BACKEND="$(echo "$DIST_BACKEND" | tr '[:upper:]' '[:lower:]')"
+case "$DIST_BACKEND" in
+    nccl|gloo|mpi)
+        ;;
+    *)
+        echo "Unsupported distributed backend '$DIST_BACKEND' (expected nccl|gloo|mpi)." >&2
+        exit 1
+        ;;
+esac
 
 if [[ ! -f "$CONFIG_TEMPLATE" ]]; then
     echo "Config file not found: $CONFIG_TEMPLATE" >&2
@@ -103,6 +127,7 @@ if [[ ${#DATASET_ARRAY[@]} -eq 0 ]]; then
 fi
 
 declare -a DATASET_CANONICAL=()
+declare -a DATASET_ROWS=()
 for spec in "${DATASET_ARRAY[@]}"; do
     if [[ "$spec" != *:* ]]; then
         echo "Dataset spec must be name:path -> '$spec'" >&2
@@ -120,6 +145,8 @@ for spec in "${DATASET_ARRAY[@]}"; do
     fi
     abs_path="$(realpath "$path")"
     DATASET_CANONICAL+=("${name}:${abs_path}")
+    row_count="$(wc -l < "$abs_path" | xargs)"
+    DATASET_ROWS+=("${row_count}")
 done
 
 IFS=',' read -ra GPU_ARRAY <<< "$GPU_STRING"
@@ -153,6 +180,7 @@ export PHASE1_CONFIG_OUTPUT="$RUN_CONFIG_PATH"
 export PHASE1_RUN_FOLDER="$RUN_FOLDER"
 export PHASE1_DATASETS="$DATASET_SPEC_JOINED"
 export PHASE1_PRETRAIN="${PRETRAIN_CKPT}"
+export PHASE1_EPOCHS="${EPOCHS_OVERRIDE}"
 export PHASE1_BATCH_SIZE="${BATCH_SIZE_OVERRIDE}"
 export PHASE1_NUM_WORKERS="${NUM_WORKERS_OVERRIDE}"
 
@@ -167,6 +195,7 @@ config_output = pathlib.Path(os.environ["PHASE1_CONFIG_OUTPUT"])
 run_folder = os.environ["PHASE1_RUN_FOLDER"]
 dataset_specs = [spec for spec in os.environ["PHASE1_DATASETS"].split(",") if spec]
 pretrained = os.environ.get("PHASE1_PRETRAIN", "")
+epochs_override = os.environ.get("PHASE1_EPOCHS")
 batch_override = os.environ.get("PHASE1_BATCH_SIZE")
 workers_override = os.environ.get("PHASE1_NUM_WORKERS")
 
@@ -195,6 +224,9 @@ if workers_override:
     cfg["data"]["num_workers"] = int(workers_override)
     cfg["data"]["persistent_workers"] = False
     cfg["data"]["pin_mem"] = False
+if epochs_override:
+    cfg.setdefault("optimization", {})
+    cfg["optimization"]["epochs"] = int(epochs_override)
 
 cfg.setdefault("meta", {})
 if pretrained:
@@ -212,15 +244,22 @@ echo "  Config template : $CONFIG_TEMPLATE"
 echo "  Run config      : $RUN_CONFIG_PATH"
 echo "  Run folder      : $RUN_FOLDER"
 echo "  Datasets        :"
-for spec in "${DATASET_CANONICAL[@]}"; do
-    echo "    - $spec"
+for idx in "${!DATASET_CANONICAL[@]}"; do
+    spec="${DATASET_CANONICAL[$idx]}"
+    rows="${DATASET_ROWS[$idx]}"
+    echo "    - $spec (${rows} rows)"
+    if [[ "$rows" -lt 1000 ]]; then
+        echo "      WARNING: small dataset detected (<1000 rows)."
+    fi
 done
 [[ -n "$PRETRAIN_CKPT" ]] && echo "  Pretrained ckpt : $PRETRAIN_CKPT"
 echo "  Devices         : ${DEVICE_ARGS[*]}"
+echo "  Backend         : $DIST_BACKEND"
 echo "  Console log     : $CONSOLE_LOG"
 
 cd "$PROJECT_ROOT"
 export TMPDIR=/tmp
 export TMP=/tmp
 export TEMP=/tmp
+export TORCH_DISTRIBUTED_BACKEND="$DIST_BACKEND"
 PYTHONPATH="$PROJECT_ROOT:${PYTHONPATH:-}" python3 -m app.main --fname "$RUN_CONFIG_PATH" --devices "${DEVICE_ARGS[@]}" 2>&1 | tee "$CONSOLE_LOG"

@@ -5,7 +5,7 @@ folder: logs/vjepa_drive/vitg16-256px-16f/
 data:
   dataset_type: drivingvideodataset
   datasets:
-    - data/nvidia_av/train_shifted_for_validation.csv
+    - data/nvidia_av/train.csv
   datasets_weights: [1]
   dataset_names: [nvidia_av]
   batch_size: 3

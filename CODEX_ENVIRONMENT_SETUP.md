@@ -63,30 +63,30 @@ python scripts/prepare_nvidia_av_data.py
 
 ## 6) Verify dataset + checkpoint inputs
 
-Phase 1 now trains ViT-L on a single NVIDIA AV CSV selected for A40 memory limits:
+Phase 1 now trains ViT-L on the full NVIDIA AV training CSV by default:
 
 ```bash
 ls /localhome/local-samehm/vjepa2/checkpoints/vitl.pt
-ls /localhome/local-samehm/vjepa2/data/nvidia_av/train_shifted_for_validation.csv
+ls /localhome/local-samehm/vjepa2/data/nvidia_av/train.csv
 ```
 
 If either file is missing, sync it from shared storage before launching jobs.
 
 ## 7) Phase 1 config + launch template (A40 default)
 
-`configs/train/vitg16/driving-joint-256px-16f.yaml` already points to ViT-L + the single CSV. Launch jobs with:
+`configs/train/vitg16/driving-joint-256px-16f.yaml` already points to ViT-L + `train.csv`. Launch jobs with:
 
 ```bash
 scripts/run_phase1_training.sh \
-  --fname configs/train/vitg16/driving-joint-256px-16f.yaml \
+  --config configs/train/vitg16/driving-joint-256px-16f.yaml \
   --gpus 0,1,2,3,4,5,6,7 \
   --pretrained checkpoints/vitl.pt \
-  --datasets data/nvidia_av/train_shifted_for_validation.csv
+  --datasets nvidia_av:data/nvidia_av/train.csv
 ```
 
 Append any extra flags (resume, logging overrides, etc.) as needed, but keep ViT-L and the dataset path unchanged unless coordinated.
 
-> NOTE: `scripts/prepare_nvidia_av_data.py` now downloads 240 clips, so the default batch size of 3 per GPU works across 8 ranks. If you trim the CSV later, ensure `world_size × batch_size` does not exceed the number of rows or update the launch args accordingly.
+> NOTE: with `train.csv` (~10K rows), `batch_size=3` per GPU on 8 ranks gives ample iterations/epoch. If you intentionally use a tiny CSV, ensure `world_size × batch_size` does not exceed the number of rows or update launch args accordingly.
 
 ## 8) Optional: run without activating shell
 
