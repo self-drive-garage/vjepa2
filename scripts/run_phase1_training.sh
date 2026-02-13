@@ -143,6 +143,7 @@ fi
 
 RUN_FOLDER="${OUTPUT_ROOT}/${RUN_NAME}"
 mkdir -p "$RUN_FOLDER"
+CONSOLE_LOG="${RUN_FOLDER}/console.log"
 
 RUN_CONFIG_PATH="${RUN_FOLDER}/phase1_config.yaml"
 DATASET_SPEC_JOINED="$(IFS=','; printf '%s' "${DATASET_CANONICAL[*]}")"
@@ -216,9 +217,10 @@ for spec in "${DATASET_CANONICAL[@]}"; do
 done
 [[ -n "$PRETRAIN_CKPT" ]] && echo "  Pretrained ckpt : $PRETRAIN_CKPT"
 echo "  Devices         : ${DEVICE_ARGS[*]}"
+echo "  Console log     : $CONSOLE_LOG"
 
 cd "$PROJECT_ROOT"
 export TMPDIR=/tmp
 export TMP=/tmp
 export TEMP=/tmp
-PYTHONPATH="$PROJECT_ROOT:${PYTHONPATH:-}" python3 -m app.main --fname "$RUN_CONFIG_PATH" --devices "${DEVICE_ARGS[@]}"
+PYTHONPATH="$PROJECT_ROOT:${PYTHONPATH:-}" python3 -m app.main --fname "$RUN_CONFIG_PATH" --devices "${DEVICE_ARGS[@]}" 2>&1 | tee "$CONSOLE_LOG"

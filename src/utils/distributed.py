@@ -41,12 +41,13 @@ def init_distributed(port=37129, rank_and_world_size=(None, None)):
             world_size, rank = 1, 0
             return world_size, rank
 
+    backend = os.environ.get("TORCH_DISTRIBUTED_BACKEND", "nccl").lower()
     try:
         os.environ["MASTER_PORT"] = str(port)
-        torch.distributed.init_process_group(backend="nccl", world_size=world_size, rank=rank)
+        torch.distributed.init_process_group(backend=backend, world_size=world_size, rank=rank)
     except Exception as e:
         world_size, rank = 1, 0
-        logger.info(f"Rank: {rank}. Distributed training not available {e}")
+        logger.info(f"Rank: {rank}. Distributed training not available ({backend=}): {e}")
 
     return world_size, rank
 

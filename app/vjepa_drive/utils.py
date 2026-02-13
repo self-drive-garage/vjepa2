@@ -5,8 +5,10 @@
 
 import logging
 import sys
+from collections import OrderedDict
 
 import torch
+from torch.nn.parallel import DistributedDataParallel
 
 from app.vjepa.utils import init_video_model, load_checkpoint as _load_checkpoint
 from src.models.trajectory_head import TrajectoryHead
@@ -14,6 +16,22 @@ from src.utils.schedulers import CosineWDSchedule, LinearDecaySchedule, WarmupCo
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logger = logging.getLogger()
+
+
+def _strip_module_prefix(state_dict):
+    """Remove a leading 'module.' (DDP) prefix from checkpoint keys when present."""
+    if not isinstance(state_dict, dict) or not state_dict:
+        return state_dict
+
+    needs_strip = any(k.startswith("module.") for k in state_dict.keys())
+    if not needs_strip:
+        return state_dict
+
+    cleaned = state_dict.__class__() if isinstance(state_dict, OrderedDict) else OrderedDict()
+    for key, value in state_dict.items():
+        new_key = key.replace("module.", "", 1)
+        cleaned[new_key] = value
+    return cleaned
 
 
 def init_trajectory_head(
@@ -146,6 +164,8 @@ def load_checkpoint(
 ):
     """Load checkpoint, handling the case where trajectory_head may not exist in old checkpoints."""
     from src.utils.checkpoint_loader import robust_checkpoint_loader
+    def _unwrap(module):
+        return module.module if isinstance(module, DistributedDataParallel) else module
 
     logger.info(f"Loading checkpoint from {r_path}")
     checkpoint = robust_checkpoint_loader(r_path, map_location=torch.device("cpu"))
@@ -155,24 +175,24 @@ def load_checkpoint(
         epoch = checkpoint["epoch"]
 
     # Load encoder
-    pretrained_dict = checkpoint["encoder"]
-    msg = encoder.load_state_dict(pretrained_dict)
+    pretrained_dict = _strip_module_prefix(checkpoint["encoder"])
+    msg = _unwrap(encoder).load_state_dict(pretrained_dict)
     logger.info(f"loaded pretrained encoder from epoch {epoch} with msg: {msg}")
 
     # Load predictor
-    pretrained_dict = checkpoint["predictor"]
-    msg = predictor.load_state_dict(pretrained_dict)
+    pretrained_dict = _strip_module_prefix(checkpoint["predictor"])
+    msg = _unwrap(predictor).load_state_dict(pretrained_dict, strict=False)
     logger.info(f"loaded pretrained predictor from epoch {epoch} with msg: {msg}")
 
     # Load target encoder
     if target_encoder is not None:
-        pretrained_dict = checkpoint["target_encoder"]
-        msg = target_encoder.load_state_dict(pretrained_dict)
+        pretrained_dict = _strip_module_prefix(checkpoint["target_encoder"])
+        msg = _unwrap(target_encoder).load_state_dict(pretrained_dict)
         logger.info(f"loaded pretrained target encoder from epoch {epoch} with msg: {msg}")
 
     # Load trajectory head (may not exist in V-JEPA2 pretrained checkpoints)
     if "trajectory_head" in checkpoint:
-        msg = trajectory_head.load_state_dict(checkpoint["trajectory_head"])
+        msg = _unwrap(trajectory_head).load_state_dict(_strip_module_prefix(checkpoint["trajectory_head"]))
         logger.info(f"loaded trajectory head from epoch {epoch} with msg: {msg}")
     else:
         logger.info("No trajectory_head in checkpoint, using randomly initialized weights")

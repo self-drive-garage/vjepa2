@@ -66,7 +66,9 @@ This creates representations that are **inherently planning-aware** — they enc
 │  ┌─────────────┐                                  │
 │  │  V-JEPA2    │──── z_masked ──→ Predictor(φ)    │
 │  │  Encoder(θ) │                   → L_jepa       │
-│  │  (ViT-g)    │                                  │
+│  │  (ViT-L on  │                                  │
+│  │  8×A40,     │                                  │
+│  │  scale→ViT-g│                                  │
 │  │             │──── z_full ────→ TrajectoryHead(ψ)│
 │  │  TRAINABLE  │                   → L_traj       │
 │  └─────────────┘                                  │
@@ -75,7 +77,7 @@ This creates representations that are **inherently planning-aware** — they enc
 └──────────────────────────────────────────────────┘
 ```
 
-**Encoder** (`VisionTransformer`): The existing V-JEPA2 ViT-g encoder. **Not frozen** — jointly trained with both objectives. Processes driving video clips and outputs dense patch-level features.
+**Encoder** (`VisionTransformer`): We start on the pretrained V-JEPA2 **ViT-L** encoder to fit comfortably on the available 8× A40 GPUs while keeping the encoder **trainable** end-to-end. The design remains compatible with ViT-g, which we will scale to once we switch onto higher-memory hardware.
 
 **Predictor** (`VisionTransformerPredictor`): The existing V-JEPA2 predictor. Takes masked encoder features and predicts target features at masked positions. Unchanged from V-JEPA2.
 
@@ -100,7 +102,7 @@ class TrajectoryHead(nn.Module):
 
     def __init__(
         self,
-        embed_dim=1408,        # ViT-g dimension
+        embed_dim=1024,        # ViT-L dimension (switch to 1408 for ViT-g)
         num_waypoints=12,      # e.g., 6 seconds at 2Hz
         waypoint_dim=2,        # (x, y) in ego frame
         num_heads=16,
@@ -539,7 +541,7 @@ meta:
 
 ### 6.1 Phase 1: Initialize from Pretrained V-JEPA2
 
-Start from the pretrained V-JEPA2 ViT-g checkpoint (available from Meta). This gives us:
+Start from the pretrained V-JEPA2 ViT-L checkpoint (Meta release `vitl.pt`). This fits within A40 memory while retaining strong video priors. Scaling to ViT-g remains the plan for later phases once we have higher-memory GPUs.
 - An encoder already trained on 22M internet videos with strong temporal understanding
 - A predictor already trained for masked latent prediction
 

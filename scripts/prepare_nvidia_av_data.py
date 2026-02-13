@@ -39,8 +39,15 @@ EGOMOTION_DIR = DATA_ROOT / "egomotion"
 TRAIN_CSV_PATH = DATA_ROOT / "train.csv"
 HF_CACHE_DIR = str(PROJECT_ROOT / "hf_cache")
 
-NUM_CLIPS = 5  # Download up to this many clips
+NUM_CLIPS = 240  # Download up to this many clips
 FEATURES_TO_DOWNLOAD = ["camera_front_wide_120fov", "egomotion"]
+
+# Clip metadata derived from configs/train/vitg16/driving-joint-256px-16f.yaml:
+#   frames_per_clip=16 sampled at 4 fps => 4-second video windows.
+#   Trajectory head predicts 12 waypoints at 0.5s each => need 6s of ego data
+#   beyond the clip end to compute training targets.
+CLIP_DURATION_SEC = 4.0
+FUTURE_MARGIN_SEC = 6.0
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -245,10 +252,47 @@ def main():
             )
 
             # Build training CSV row
-            # clip_start_time and clip_end_time are the first and last
-            # ego-motion timestamps in seconds
-            clip_start_time = ego_df["timestamp"].iloc[0]
-            clip_end_time = ego_df["timestamp"].iloc[-1]
+            # Derive clip window within the ego-motion span.
+            # Ensure we leave FUTURE_MARGIN_SEC seconds after clip end so
+            # compute_future_waypoints_from_poses can build 12×0.5s targets.
+            ego_start = float(ego_df["timestamp"].iloc[0])
+            ego_end = float(ego_df["timestamp"].iloc[-1])
+            if ego_end - ego_start < CLIP_DURATION_SEC + FUTURE_MARGIN_SEC:
+                logger.warning(
+                    "  Skipping clip %s: insufficient duration "
+                    "(available=%.3fs, required>=%.3fs)",
+                    clip_id,
+                    ego_end - ego_start,
+                    CLIP_DURATION_SEC + FUTURE_MARGIN_SEC,
+                )
+                continue
+
+            clip_start_time = ego_start + FUTURE_MARGIN_SEC
+            clip_end_time = clip_start_time + CLIP_DURATION_SEC
+
+            max_end_time = ego_end - FUTURE_MARGIN_SEC
+            if clip_end_time > max_end_time:
+                shift = clip_end_time - max_end_time
+                clip_end_time -= shift
+                clip_start_time -= shift
+
+            if clip_start_time < ego_start:
+                logger.warning(
+                    "  Skipping clip %s: cannot satisfy future margin "
+                    "(attempted start=%.3fs, ego_start=%.3fs)",
+                    clip_id,
+                    clip_start_time,
+                    ego_start,
+                )
+                continue
+
+            logger.info(
+                "  Clip window selected: start=%.3fs end=%.3fs (ego span %.3fs-%.3fs)",
+                clip_start_time,
+                clip_end_time,
+                ego_start,
+                ego_end,
+            )
 
             train_rows.append(
                 {
