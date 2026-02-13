@@ -27,6 +27,7 @@ import zipfile
 
 import numpy as np
 import pandas as pd
+from typing import Iterable
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -39,8 +40,12 @@ EGOMOTION_DIR = DATA_ROOT / "egomotion"
 TRAIN_CSV_PATH = DATA_ROOT / "train.csv"
 HF_CACHE_DIR = str(PROJECT_ROOT / "hf_cache")
 
-NUM_CLIPS = 240  # Download up to this many clips
 FEATURES_TO_DOWNLOAD = ["camera_front_wide_120fov", "egomotion"]
+
+# Disk-space heuristics (overridable via env vars)
+DEFAULT_BYTES_PER_CLIP = int(float(os.environ.get("VJEPA_BYTES_PER_CLIP_MB", "25")) * 1024 * 1024)
+DISK_RESERVE_GB = float(os.environ.get("VJEPA_DISK_RESERVE_GB", "50"))
+MAX_CLIPS_CAP = int(os.environ.get("VJEPA_MAX_CLIPS", "10000"))
 
 # Clip metadata derived from configs/train/vitg16/driving-joint-256px-16f.yaml:
 #   frames_per_clip=16 sampled at 4 fps => 4-second video windows.
@@ -58,6 +63,42 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 logger = logging.getLogger("prepare_nvidia_av_data")
+
+
+def _bytes_free_across_paths(paths: Iterable[pathlib.Path]) -> int:
+    """Estimate total free bytes across unique filesystems hosting the given paths."""
+    total = 0
+    seen_devices = set()
+    for path in paths:
+        path.mkdir(parents=True, exist_ok=True)
+        resolved = path.resolve()
+        stat_info = os.stat(resolved)
+        if stat_info.st_dev in seen_devices:
+            continue
+        seen_devices.add(stat_info.st_dev)
+        vfs = os.statvfs(resolved)
+        total += vfs.f_bavail * vfs.f_frsize
+    return total
+
+
+def estimate_num_clips(avail_clip_count: int) -> tuple[int, int, int]:
+    """Estimate maximum clips that fit given disk availability.
+
+    Returns:
+        (clip_count, total_free_bytes, usable_bytes_after_reserve)
+    """
+    reserve_bytes = int(DISK_RESERVE_GB * (1024**3))
+    candidates = [
+        DATA_ROOT,
+        VIDEO_DIR,
+        EGOMOTION_DIR,
+        pathlib.Path(HF_CACHE_DIR),
+    ]
+    total_free = _bytes_free_across_paths(candidates)
+    usable_bytes = max(total_free - reserve_bytes, 0)
+    max_by_disk = usable_bytes // DEFAULT_BYTES_PER_CLIP
+    est = min(avail_clip_count, MAX_CLIPS_CAP, max_by_disk)
+    return int(est), total_free, usable_bytes
 
 
 def read_hf_token(token_path: str) -> str:
@@ -188,9 +229,24 @@ def main():
     all_clip_ids = ds.clip_index.index.tolist()
     logger.info(f"  Total clips available: {len(all_clip_ids)}")
 
-    # Select the first NUM_CLIPS clips
-    selected_clip_ids = all_clip_ids[:NUM_CLIPS]
-    logger.info(f"  Selected {len(selected_clip_ids)} clips: {selected_clip_ids}")
+    num_clips, total_free_bytes, usable_bytes = estimate_num_clips(len(all_clip_ids))
+    if num_clips <= 0:
+        logger.error(
+            "Insufficient disk space. Free more than %.1f GB to download clips.",
+            DISK_RESERVE_GB,
+        )
+        sys.exit(1)
+
+    selected_clip_ids = all_clip_ids[:num_clips]
+    logger.info(
+        "  Free space: %.2f GB (usable %.2f GB after reserve %.1f GB) | Clip size %.2f MB | Selecting %d clips",
+        total_free_bytes / (1024**3),
+        usable_bytes / (1024**3),
+        DISK_RESERVE_GB,
+        DEFAULT_BYTES_PER_CLIP / (1024 * 1024),
+        len(selected_clip_ids),
+    )
+    logger.debug(f"  Selected clip ids: {selected_clip_ids}")
 
     # ------------------------------------------------------------------
     # Step 4: Create output directories
