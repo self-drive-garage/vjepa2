@@ -20,7 +20,12 @@ import pandas as pd
 import torch
 from decord import VideoReader, cpu
 
-from src.datasets.ego_motion_utils import compute_future_waypoints_from_poses, get_ego_motion_loader
+from app.vjepa_drive.types import DrivingBatch, DrivingSample
+from src.datasets.ego_motion_utils import (
+    compute_future_waypoints_from_poses,
+    compute_history_waypoints_from_poses,
+    get_ego_motion_loader,
+)
 from src.datasets.utils.dataloader import ConcatIndices, MonitoredDataset, NondeterministicDataLoader
 from src.datasets.utils.weighted_sampler import DistributedWeightedSampler
 
@@ -56,6 +61,8 @@ def make_drivingvideodataset(
     # Driving-specific params
     trajectory_horizon=12,
     trajectory_dt=0.5,
+    trajectory_history_horizon=8,
+    trajectory_history_dt=0.5,
     dataset_names=None,
 ):
     dataset = DrivingVideoDataset(
@@ -75,6 +82,8 @@ def make_drivingvideodataset(
         transform=transform,
         trajectory_horizon=trajectory_horizon,
         trajectory_dt=trajectory_dt,
+        trajectory_history_horizon=trajectory_history_horizon,
+        trajectory_history_dt=trajectory_history_dt,
         dataset_names=dataset_names,
     )
 
@@ -130,6 +139,7 @@ class DrivingVideoDataset(torch.utils.data.Dataset):
     Each sample returns:
     - buffer: list of [C, T, H, W] video clips (same as VideoDataset)
     - gt_trajectory: [horizon, 2] future ego waypoints in ego frame
+    - ego_history: [history_horizon, 2] past ego waypoints in ego frame
     - clip_indices: frame indices (same as VideoDataset)
 
     CSV format (space-delimited):
@@ -161,6 +171,8 @@ class DrivingVideoDataset(torch.utils.data.Dataset):
         filter_long_videos=int(10**9),
         trajectory_horizon=12,
         trajectory_dt=0.5,
+        trajectory_history_horizon=8,
+        trajectory_history_dt=0.5,
         dataset_names=None,
     ):
         self.data_paths = data_paths
@@ -177,6 +189,8 @@ class DrivingVideoDataset(torch.utils.data.Dataset):
         self.fps = fps
         self.trajectory_horizon = trajectory_horizon
         self.trajectory_dt = trajectory_dt
+        self.trajectory_history_horizon = trajectory_history_horizon
+        self.trajectory_history_dt = trajectory_history_dt
 
         if sum([v is not None for v in (fps, duration, frame_step)]) != 1:
             raise ValueError(f"Must specify exactly one of either {fps=}, {duration=}, or {frame_step=}.")
@@ -272,7 +286,15 @@ class DrivingVideoDataset(torch.utils.data.Dataset):
                 horizon=self.trajectory_horizon,
                 dt=self.trajectory_dt,
             )
-            if gt_trajectory is None:
+            ego_history = compute_history_waypoints_from_poses(
+                timestamps=timestamps,
+                positions=positions,
+                headings=headings,
+                ref_timestamp=sampled_clip_end_time,
+                horizon=self.trajectory_history_horizon,
+                dt=self.trajectory_history_dt,
+            )
+            if gt_trajectory is None or ego_history is None:
                 return None
         except Exception as e:
             logger.warning(f"Failed to load ego-motion for {sample['ego_path']}: {e}")
@@ -290,7 +312,12 @@ class DrivingVideoDataset(torch.utils.data.Dataset):
         if self.transform is not None:
             buffer = [self.transform(clip) for clip in buffer]
 
-        return buffer, gt_trajectory, clip_indices
+        return DrivingSample(
+            buffer=buffer,
+            gt_trajectory=gt_trajectory,
+            ego_history=ego_history,
+            clip_indices=clip_indices,
+        )
 
     def _loadvideo_decord(self, fname, fpc, sample=None):
         """Load video using Decord (mirrors VideoDataset.loadvideo_decord)."""
@@ -411,11 +438,13 @@ class DrivingMaskCollator:
 
     The standard MaskCollator returns:
         fpc_collations: list of (collated_batch, masks_enc, masks_pred)
+        where collated_batch is [videos, labels, clip_indices].
 
     This wrapper returns:
-        fpc_collations: list of (collated_batch, masks_enc, masks_pred, gt_trajectories)
+        fpc_collations: list of DrivingBatch objects with explicit fields
+        (videos, labels, clip_indices, masks_enc, masks_pred, gt_trajectories, ego_histories)
 
-    where gt_trajectories is a [B, horizon, 2] tensor.
+    where gt_trajectories=[B, horizon, 2] and ego_histories=[B, history_horizon, 2].
     """
 
     def __init__(self, mask_collator):
@@ -425,8 +454,8 @@ class DrivingMaskCollator:
         self.mask_collator.step()
 
     def __call__(self, batch):
-        # batch is a list of (buffer, gt_trajectory, clip_indices) tuples
-        # We need to separate trajectories from the rest before calling MaskCollator
+        # batch is a list of DrivingSample objects.
+        # We need to separate trajectories/history from the rest before calling MaskCollator
 
         # Reconstruct the batch in the format MaskCollator expects:
         # (buffer, label, clip_indices) — we use gt_trajectory as the "label"
@@ -435,8 +464,7 @@ class DrivingMaskCollator:
         # Group by fpc (frames per clip) like MaskCollator does
         filtered_batches = {}
         for sample in batch:
-            buffer, gt_trajectory, clip_indices = sample
-            fpc = len(clip_indices[-1])
+            fpc = len(sample.clip_indices[-1])
             if fpc not in filtered_batches:
                 filtered_batches[fpc] = []
             filtered_batches[fpc].append(sample)
@@ -447,12 +475,13 @@ class DrivingMaskCollator:
             if batch_size == 0:
                 continue
 
-            # Separate trajectories
-            gt_trajectories = torch.stack([s[1] for s in fpc_batch])
+            # Separate trajectory targets and ego-history conditioning.
+            gt_trajectories = torch.stack([s.gt_trajectory for s in fpc_batch])
+            ego_histories = torch.stack([s.ego_history for s in fpc_batch])
 
             # Create a batch in the format MaskCollator expects
             # MaskCollator expects: list of (buffer, label, clip_indices)
-            mask_batch = [(s[0], 0, s[2]) for s in fpc_batch]
+            mask_batch = [(s.buffer, 0, s.clip_indices) for s in fpc_batch]
 
             # Call the underlying MaskCollator on this single-fpc batch
             # MaskCollator internally groups by fpc, but here we've already
@@ -460,8 +489,17 @@ class DrivingMaskCollator:
             mask_result = self.mask_collator(mask_batch)
 
             for collated_batch, masks_enc, masks_pred in mask_result:
+                videos, labels, clip_indices = collated_batch
                 fpc_collations.append(
-                    (collated_batch, masks_enc, masks_pred, gt_trajectories)
+                    DrivingBatch(
+                        videos=list(videos),
+                        labels=labels,
+                        clip_indices=list(clip_indices),
+                        masks_enc=masks_enc,
+                        masks_pred=masks_pred,
+                        gt_trajectories=gt_trajectories,
+                        ego_histories=ego_histories,
+                    )
                 )
 
         return fpc_collations

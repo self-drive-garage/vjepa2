@@ -38,9 +38,15 @@ def init_trajectory_head(
     embed_dim,
     num_waypoints=12,
     waypoint_dim=2,
+    num_modes=4,
+    history_dim=2,
+    history_hidden_dim=None,
+    history_tokens=8,
     num_heads=16,
     mlp_ratio=4.0,
     pooler_depth=2,
+    min_log_std=-4.0,
+    max_log_std=1.0,
     device=torch.device("cpu"),
     use_activation_checkpointing=False,
 ):
@@ -49,9 +55,15 @@ def init_trajectory_head(
         embed_dim=embed_dim,
         num_waypoints=num_waypoints,
         waypoint_dim=waypoint_dim,
+        num_modes=num_modes,
+        history_dim=history_dim,
+        history_hidden_dim=history_hidden_dim,
+        history_tokens=history_tokens,
         num_heads=num_heads,
         mlp_ratio=mlp_ratio,
         pooler_depth=pooler_depth,
+        min_log_std=min_log_std,
+        max_log_std=max_log_std,
         use_activation_checkpointing=use_activation_checkpointing,
     )
     trajectory_head.to(device)
@@ -192,7 +204,10 @@ def load_checkpoint(
 
     # Load trajectory head (may not exist in V-JEPA2 pretrained checkpoints)
     if "trajectory_head" in checkpoint:
-        msg = _unwrap(trajectory_head).load_state_dict(_strip_module_prefix(checkpoint["trajectory_head"]))
+        msg = _unwrap(trajectory_head).load_state_dict(
+            _strip_module_prefix(checkpoint["trajectory_head"]),
+            strict=False,
+        )
         logger.info(f"loaded trajectory head from epoch {epoch} with msg: {msg}")
     else:
         logger.info("No trajectory_head in checkpoint, using randomly initialized weights")

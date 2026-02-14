@@ -130,6 +130,8 @@ The `scripts/run_phase1_training.sh` helper wraps `app/main.py` so you can rapid
 - `--num-workers` throttles the DataLoader for small dev rigs (set it to `0` if `/dev/shm` is restricted or you need deterministic CPU-only debugging).
 - `--config` can point at the included `configs/train/debug-phase1-tiny.yaml` to run a ~5 second CPU verification loop (`./scripts/run_phase1_training.sh --config configs/train/debug-phase1-tiny.yaml --gpus cpu --num-workers 0`). This uses the micro ViT head so you can validate losses/logging without touching CUDA.
 - Keep `VJEPA_FAKE_VIDEO` **unset** for all production runs; the temporary synthetic-video shortcut has been removed so end-to-end jobs always read the real driving datasets.
+- Driving Phase 1 now supports explicit ego-history conditioning (`trajectory_history_horizon`, `trajectory_history_dt`) plus multimodal trajectory prediction (`model.trajectory_head.num_modes`) with uncertainty-aware losses (ADE/FDE/NLL/calibration/smoothness/feasibility terms in `loss`).
+- Runtime guardrails for deployment are provided in `app/vjepa_drive/runtime_safety.py` via `select_trajectory_with_safety_envelope`, configured by the optional `runtime_safety` block in train YAMLs.
 
 The script re-materializes a run-specific YAML in `logs/vjepa_drive/<run-name>/phase1_config.yaml`, records the exact arguments in `params-pretrain.yaml`, and emits checkpoints every `save_every_freq` epochs (5 epochs for the debug config, 5 epochs for the full recipe by default).
 

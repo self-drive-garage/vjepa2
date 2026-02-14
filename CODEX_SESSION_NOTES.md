@@ -10,6 +10,20 @@ Purpose: scratchpad of facts gathered this session so future Codex launches reta
     - `configs/train/vitg16/driving-joint-256px-16f.yaml`: canonical Phase 1 config (already set to ViT-L + `train_shifted_for_validation.csv`); pass it directly to `run_phase1_training.sh`.
 - `scripts/run_phase1_training.sh`: wraps config rewrite + distributed launch.
 
+## Rewrite Snapshot (Feb 13)
+- Implemented multimodal, ego-history-conditioned trajectory head:
+  - `src/models/trajectory_head.py` now predicts `(means, log_stds, mode_logits)` and still returns single best mode in `forward()` for backward compatibility.
+- Upgraded driving training objective:
+  - `app/vjepa_drive/losses.py` adds ADE/FDE/NLL/calibration/smoothness/feasibility losses plus scalar scheduling helper.
+  - `app/vjepa_drive/train.py` now ramps `lambda_traj` over epochs and logs multimodal uncertainty metrics.
+- Data pipeline now carries explicit history conditioning:
+  - `src/datasets/ego_motion_utils.py` adds `compute_history_waypoints_from_poses`.
+  - `src/datasets/driving_dataset.py` returns `ego_history` with each sample and collates it.
+- NVIDIA AV prep windowing is now tied to recipe requirements:
+  - `scripts/prepare_nvidia_av_data.py` derives clip/history/future margins from env-configurable horizons and checkpoints CSV periodically.
+- Runtime deployment guardrail:
+  - `app/vjepa_drive/runtime_safety.py` selects a trajectory by confidence/uncertainty/dynamics thresholds with fallback behavior.
+
 ## Environment / Infra Notes
 - System has 8× NVIDIA A40 GPUs (driver 590.48.01, CUDA 13.1). `nvidia-smi` works only when Codex sandbox is `danger-full-access`.
 - `codex-launch.sh` now defaults to `CODEX_SANDBOX_MODE=danger-full-access`; rerun `./codex-launch.sh` to start a GPU-capable session.

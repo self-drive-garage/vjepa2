@@ -12,12 +12,14 @@ a training CSV compatible with V-JEPA2's DrivingVideoDataset.
 
 Usage:
     python scripts/prepare_nvidia_av_data.py
+    python scripts/prepare_nvidia_av_data.py --no-download
 
 Requires:
     - physical_ai_av devkit installed (pip install -e physical_ai_av/)
     - HuggingFace token at /localhome/local-samehm/.hugging_face_token
 """
 
+import argparse
 import io
 import logging
 import os
@@ -27,8 +29,11 @@ import zipfile
 
 import numpy as np
 import pandas as pd
+import yaml
 from collections import OrderedDict
 from typing import Iterable
+
+from app.vjepa_drive.temporal_recipe import TemporalRecipe
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -46,17 +51,12 @@ FEATURES_TO_DOWNLOAD = ["camera_front_wide_120fov", "egomotion"]
 # Disk-space heuristics (overridable via env vars)
 DEFAULT_BYTES_PER_CLIP = int(float(os.environ.get("VJEPA_BYTES_PER_CLIP_MB", "25")) * 1024 * 1024)
 DISK_RESERVE_GB = float(os.environ.get("VJEPA_DISK_RESERVE_GB", "50"))
-MAX_CLIPS_CAP = int(os.environ.get("VJEPA_MAX_CLIPS", "10000"))
-MAX_SAMPLES_CAP = int(os.environ.get("VJEPA_MAX_SAMPLES", "30000"))
+MAX_CLIPS_CAP = int(os.environ.get("VJEPA_MAX_CLIPS", "5000000"))
+MAX_SAMPLES_CAP = int(os.environ.get("VJEPA_MAX_SAMPLES", "5000000"))
 CLIP_STRIDE_SEC = float(os.environ.get("VJEPA_CLIP_STRIDE_SEC", "1.0"))
 MAX_WINDOWS_PER_CLIP = int(os.environ.get("VJEPA_MAX_WINDOWS_PER_CLIP", "0"))
-
-# Clip metadata derived from configs/train/vitg16/driving-joint-256px-16f.yaml:
-#   frames_per_clip=16 sampled at 4 fps => 4-second video windows.
-#   Trajectory head predicts 12 waypoints at 0.5s each => need 6s of ego data
-#   beyond the clip end to compute training targets.
-CLIP_DURATION_SEC = 4.0
-FUTURE_MARGIN_SEC = 6.0
+WRITE_EVERY_CLIPS = int(os.environ.get("VJEPA_WRITE_EVERY_CLIPS", "50"))
+TRAIN_CONFIG_PATH = os.environ.get("VJEPA_TRAIN_CONFIG", "").strip()
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -67,6 +67,39 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 logger = logging.getLogger("prepare_nvidia_av_data")
+
+
+def resolve_temporal_recipe() -> TemporalRecipe:
+    """Load temporal recipe from training config when provided, else env defaults."""
+    if TRAIN_CONFIG_PATH:
+        cfg_path = pathlib.Path(TRAIN_CONFIG_PATH)
+        if cfg_path.exists():
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+                data_cfg = cfg.get("data", {})
+                recipe = TemporalRecipe.from_data_cfg(data_cfg)
+                logger.info("Using temporal recipe from train config: %s", cfg_path)
+                return recipe
+            except Exception as exc:
+                logger.warning(
+                    "Failed to read temporal recipe from %s (%s); falling back to env defaults.",
+                    cfg_path,
+                    exc,
+                )
+        else:
+            logger.warning(
+                "VJEPA_TRAIN_CONFIG was set to %s but file does not exist; falling back to env defaults.",
+                cfg_path,
+            )
+    return TemporalRecipe.from_env()
+
+
+# Temporal recipe shared with training.
+TEMPORAL_RECIPE = resolve_temporal_recipe()
+CLIP_DURATION_SEC = TEMPORAL_RECIPE.clip_duration_sec
+HISTORY_MARGIN_SEC = TEMPORAL_RECIPE.history_margin_sec
+FUTURE_MARGIN_SEC = TEMPORAL_RECIPE.future_margin_sec
 
 
 def _bytes_free_across_paths(paths: Iterable[pathlib.Path]) -> int:
@@ -149,13 +182,13 @@ def select_clip_windows_from_ego_df(
     ego_start = float(ego_df["timestamp"].iloc[0])
     ego_end = float(ego_df["timestamp"].iloc[-1])
     available = ego_end - ego_start
-    required = CLIP_DURATION_SEC + FUTURE_MARGIN_SEC
+    required = HISTORY_MARGIN_SEC + CLIP_DURATION_SEC + FUTURE_MARGIN_SEC
     if available < required:
         raise ValueError(
             f"insufficient duration for clip {clip_id}: available={available:.3f}s < required={required:.3f}s"
         )
 
-    min_start_time = ego_start + FUTURE_MARGIN_SEC
+    min_start_time = ego_start + HISTORY_MARGIN_SEC
     max_start_time = ego_end - FUTURE_MARGIN_SEC - CLIP_DURATION_SEC
     if max_start_time < min_start_time:
         raise ValueError(
@@ -211,6 +244,22 @@ def load_existing_train_rows(train_csv_path: pathlib.Path) -> OrderedDict[str, d
         train_csv_path,
     )
     return rows
+
+
+def write_train_rows(train_csv_path: pathlib.Path, train_row_map: OrderedDict[str, dict[str, str]]) -> None:
+    """Write space-delimited rows in DrivingVideoDataset format."""
+    with open(train_csv_path, "w") as f:
+        for row in train_row_map.values():
+            line = " ".join(
+                [
+                    row["video_path"],
+                    row["ego_motion_path"],
+                    row["clip_start_time"],
+                    row["clip_end_time"],
+                    row["dataset_name"],
+                ]
+            )
+            f.write(line + "\n")
 
 
 def feature_zip_cached(ds, clip_id: str, feature: str) -> bool:
@@ -281,53 +330,110 @@ def extract_egomotion_csv(
     return df
 
 
-def main():
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Prepare NVIDIA AV dataset for V-JEPA2 driving training.")
+    parser.add_argument(
+        "--no-download",
+        action="store_true",
+        help=(
+            "Process only existing local assets (videos + ego-motion CSVs) and never download from Hugging Face."
+        ),
+    )
+    return parser.parse_args()
+
+
+def discover_local_clip_ids(video_dir: pathlib.Path, egomotion_dir: pathlib.Path) -> list[str]:
+    video_ids = {p.stem for p in video_dir.glob("*.mp4")}
+    ego_ids = {p.stem for p in egomotion_dir.glob("*.csv")}
+    shared = sorted(video_ids & ego_ids)
+
+    missing_ego = len(video_ids - ego_ids)
+    missing_video = len(ego_ids - video_ids)
+    logger.info(
+        "  Local assets: %d videos, %d ego CSVs, %d clips with both assets.",
+        len(video_ids),
+        len(ego_ids),
+        len(shared),
+    )
+    if missing_ego > 0 or missing_video > 0:
+        logger.info(
+            "  Mismatched local assets: %d videos missing ego CSV, %d ego CSVs missing video.",
+            missing_ego,
+            missing_video,
+        )
+    return shared
+
+
+def main(args: argparse.Namespace):
     logger.info("=" * 70)
     logger.info("NVIDIA Physical AI AV Data Preparation for V-JEPA2")
     logger.info("=" * 70)
 
-    # ------------------------------------------------------------------
-    # Step 1: Read HuggingFace token
-    # ------------------------------------------------------------------
-    logger.info("Step 1: Reading HuggingFace token...")
-    token = read_hf_token(HF_TOKEN_PATH)
+    ds = None
 
     # ------------------------------------------------------------------
-    # Step 2: Initialize the dataset interface
+    # Step 1: Initialize source clips
     # ------------------------------------------------------------------
-    logger.info("Step 2: Initializing PhysicalAIAVDatasetInterface...")
-    from physical_ai_av import PhysicalAIAVDatasetInterface
-
-    ds = PhysicalAIAVDatasetInterface(
-        token=token,
-        cache_dir=HF_CACHE_DIR,
-        confirm_download_threshold_gb=float("inf"),
-    )
-    logger.info(f"  Dataset interface initialized: {ds}")
-
-    # ------------------------------------------------------------------
-    # Step 3: List available clips and select a subset
-    # ------------------------------------------------------------------
-    logger.info("Step 3: Listing available clips...")
-    all_clip_ids = ds.clip_index.index.tolist()
-    logger.info(f"  Total clips available: {len(all_clip_ids)}")
-
-    num_clips, total_free_bytes, usable_bytes = estimate_num_clips(len(all_clip_ids))
-    if num_clips <= 0:
-        logger.error(
-            "Insufficient disk space. Free more than %.1f GB to download clips.",
-            DISK_RESERVE_GB,
+    if args.no_download:
+        logger.info("Step 1: --no-download enabled; using local assets only.")
+        VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+        EGOMOTION_DIR.mkdir(parents=True, exist_ok=True)
+        local_clip_ids = discover_local_clip_ids(VIDEO_DIR, EGOMOTION_DIR)
+        if not local_clip_ids:
+            logger.error("No local clips with both video and ego CSV were found.")
+            sys.exit(1)
+        selected_clip_ids = local_clip_ids[:MAX_CLIPS_CAP]
+        logger.info(
+            "  Selecting %d local clips (capped by VJEPA_MAX_CLIPS=%d).",
+            len(selected_clip_ids),
+            MAX_CLIPS_CAP,
         )
-        sys.exit(1)
+    else:
+        logger.info("Step 1: Reading HuggingFace token...")
+        token = read_hf_token(HF_TOKEN_PATH)
 
-    selected_clip_ids = all_clip_ids[:num_clips]
+        logger.info("Step 2: Initializing PhysicalAIAVDatasetInterface...")
+        from physical_ai_av import PhysicalAIAVDatasetInterface
+
+        ds = PhysicalAIAVDatasetInterface(
+            token=token,
+            cache_dir=HF_CACHE_DIR,
+            confirm_download_threshold_gb=float("inf"),
+        )
+        logger.info(f"  Dataset interface initialized: {ds}")
+
+        logger.info("Step 3: Listing available clips...")
+        all_clip_ids = ds.clip_index.index.tolist()
+        logger.info(f"  Total clips available: {len(all_clip_ids)}")
+
+        num_clips, total_free_bytes, usable_bytes = estimate_num_clips(len(all_clip_ids))
+        if num_clips <= 0:
+            logger.error(
+                "Insufficient disk space. Free more than %.1f GB to download clips.",
+                DISK_RESERVE_GB,
+            )
+            sys.exit(1)
+
+        selected_clip_ids = all_clip_ids[:num_clips]
+        logger.info(
+            "  Free space: %.2f GB (usable %.2f GB after reserve %.1f GB) | Clip size %.2f MB | Selecting %d clips",
+            total_free_bytes / (1024**3),
+            usable_bytes / (1024**3),
+            DISK_RESERVE_GB,
+            DEFAULT_BYTES_PER_CLIP / (1024 * 1024),
+            len(selected_clip_ids),
+        )
     logger.info(
-        "  Free space: %.2f GB (usable %.2f GB after reserve %.1f GB) | Clip size %.2f MB | Selecting %d clips",
-        total_free_bytes / (1024**3),
-        usable_bytes / (1024**3),
-        DISK_RESERVE_GB,
-        DEFAULT_BYTES_PER_CLIP / (1024 * 1024),
-        len(selected_clip_ids),
+        "  Temporal recipe: clip=%.2fs (%d frames @ %.2f fps), history=%.2fs (%d @ %.2fs), future=%.2fs (%d @ %.2fs)",
+        CLIP_DURATION_SEC,
+        TEMPORAL_RECIPE.frames_per_clip,
+        TEMPORAL_RECIPE.clip_fps,
+        HISTORY_MARGIN_SEC,
+        TEMPORAL_RECIPE.history_horizon,
+        TEMPORAL_RECIPE.history_dt,
+        FUTURE_MARGIN_SEC,
+        TEMPORAL_RECIPE.future_horizon,
+        TEMPORAL_RECIPE.future_dt,
     )
     logger.debug(f"  Selected clip ids: {selected_clip_ids}")
 
@@ -379,35 +485,50 @@ def main():
                 logger.info("  Local video + ego CSV found. Skipping download and extraction.")
                 reused_local_assets += 1
             else:
-                missing_features = [
-                    feature
-                    for feature in FEATURES_TO_DOWNLOAD
-                    if not feature_zip_cached(ds, clip_id, feature)
-                ]
-                if missing_features:
-                    logger.info("  Downloading missing features: %s", missing_features)
-                    ds.download_clip_features(
-                        clip_id=clip_id,
-                        features=missing_features,
+                if args.no_download:
+                    logger.info(
+                        "  Missing local assets for clip %s; skipping because --no-download is set.",
+                        clip_id,
                     )
-                    logger.info("  Download complete.")
                 else:
-                    logger.info("  All requested features already cached. Skipping download.")
+                    missing_features = [
+                        feature
+                        for feature in FEATURES_TO_DOWNLOAD
+                        if not feature_zip_cached(ds, clip_id, feature)
+                    ]
+                    if missing_features:
+                        logger.info("  Downloading missing features: %s", missing_features)
+                        ds.download_clip_features(
+                            clip_id=clip_id,
+                            features=missing_features,
+                        )
+                        logger.info("  Download complete.")
+                    else:
+                        logger.info("  All requested features already cached. Skipping download.")
 
-                if video_exists:
-                    logger.info("  Video already exists. Skipping extraction: %s", video_path)
-                else:
-                    logger.info("  Extracting video bytes from zip...")
-                    video_bytes = extract_video_bytes_from_zip(
-                        ds, clip_id, "camera_front_wide_120fov"
-                    )
-                    save_video(video_bytes, video_path)
+                    if video_exists:
+                        logger.info("  Video already exists. Skipping extraction: %s", video_path)
+                    else:
+                        logger.info("  Extracting video bytes from zip...")
+                        video_bytes = extract_video_bytes_from_zip(
+                            ds, clip_id, "camera_front_wide_120fov"
+                        )
+                        save_video(video_bytes, video_path)
+
+                if not video_path.exists() or not ego_csv_path.exists():
+                    continue
 
             # Extract ego-motion at frame timestamps and save CSV
             if ego_exists:
                 logger.info("  Ego-motion CSV already exists. Reusing: %s", ego_csv_path)
                 ego_df = pd.read_csv(ego_csv_path)
             else:
+                if args.no_download:
+                    logger.info(
+                        "  Ego-motion CSV missing for clip %s; skipping because --no-download is set.",
+                        clip_id,
+                    )
+                    continue
                 logger.info("  Getting video reader for frame timestamps...")
                 video_reader = ds.get_clip_feature(clip_id, "camera_front_wide_120fov")
                 frame_timestamps = video_reader.timestamps  # microseconds
@@ -468,6 +589,13 @@ def main():
                 f"  Successfully processed clip {clip_id} "
                 f"({len(clip_windows)} windows)"
             )
+            if WRITE_EVERY_CLIPS > 0 and successful_clips % WRITE_EVERY_CLIPS == 0:
+                write_train_rows(TRAIN_CSV_PATH, train_row_map)
+                logger.info(
+                    "  Checkpointed training CSV after %d successful clips (%d rows).",
+                    successful_clips,
+                    len(train_row_map),
+                )
 
         except Exception as e:
             logger.error(f"  FAILED to process clip {clip_id}: {e}", exc_info=True)
@@ -484,18 +612,7 @@ def main():
         sys.exit(1)
 
     # Write space-delimited CSV without header (as expected by DrivingVideoDataset)
-    with open(TRAIN_CSV_PATH, "w") as f:
-        for row in train_row_map.values():
-            line = " ".join(
-                [
-                    row["video_path"],
-                    row["ego_motion_path"],
-                    row["clip_start_time"],
-                    row["clip_end_time"],
-                    row["dataset_name"],
-                ]
-            )
-            f.write(line + "\n")
+    write_train_rows(TRAIN_CSV_PATH, train_row_map)
 
     logger.info(f"  Training CSV written with {len(train_row_map)} entries.")
 
@@ -537,4 +654,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(parse_args())

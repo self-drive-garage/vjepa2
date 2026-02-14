@@ -21,6 +21,8 @@ data:
   persistent_workers: true
   trajectory_horizon: 12
   trajectory_dt: 0.5
+  trajectory_history_horizon: 8
+  trajectory_history_dt: 0.5
 
 data_aug:
   random_resize_aspect_ratio: [0.75, 1.3333]
@@ -43,6 +45,12 @@ model:
   trajectory_head:
     num_waypoints: 12
     waypoint_dim: 2
+    num_modes: 4
+    history_dim: 2
+    history_tokens: 8
+    history_hidden_dim: 512
+    min_log_std: -4.0
+    max_log_std: 1.0
     pooler_depth: 2
     num_heads: 16
     mlp_ratio: 4.0
@@ -59,7 +67,26 @@ mask:
 
 loss:
   loss_exp: 1.0
-  lambda_traj: 1.0
+  lambda_traj_start: 0.5
+  lambda_traj_end: 4.0
+  lambda_traj_schedule: cosine
+  lambda_traj_ramp_epochs: 40
+  loss_ade_weight: 1.0
+  loss_fde_weight: 1.0
+  loss_nll_weight: 0.5
+  loss_calib_weight: 0.1
+  loss_smoothness_weight: 0.05
+  loss_feasibility_weight: 0.05
+  feasibility_speed_limit_mps: 25.0
+  feasibility_accel_limit_mps2: 6.0
+
+runtime_safety:
+  min_confidence: 0.45
+  max_avg_std: 2.5
+  max_mode_entropy: 1.2
+  speed_limit_mps: 25.0
+  accel_limit_mps2: 6.0
+  fallback_mode: constant_velocity
 
 optimization:
   lr: 0.000525

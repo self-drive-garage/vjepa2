@@ -43,25 +43,70 @@ def compute_future_waypoints_from_poses(
         waypoints: [horizon, 2] tensor of (x, y) in ego frame, or None if
                    the required future timestamps exceed available data
     """
-    # Find reference pose via interpolation
+    offsets = np.arange(1, horizon + 1, dtype=np.float64) * float(dt)
+    return compute_waypoints_at_offsets_from_poses(
+        timestamps=timestamps,
+        positions=positions,
+        headings=headings,
+        ref_timestamp=ref_timestamp,
+        offsets=offsets,
+    )
+
+
+def compute_history_waypoints_from_poses(
+    timestamps,
+    positions,
+    headings,
+    ref_timestamp,
+    horizon=8,
+    dt=0.5,
+):
+    """Compute past (x, y) waypoints in ego frame at ref_timestamp.
+
+    Waypoints are returned oldest->most-recent relative to the current ego frame.
+    For horizon=8, dt=0.5 this corresponds to [-4.0s, ..., -0.5s].
+    """
+    offsets = -np.arange(horizon, 0, -1, dtype=np.float64) * float(dt)
+    return compute_waypoints_at_offsets_from_poses(
+        timestamps=timestamps,
+        positions=positions,
+        headings=headings,
+        ref_timestamp=ref_timestamp,
+        offsets=offsets,
+    )
+
+
+def compute_waypoints_at_offsets_from_poses(
+    timestamps,
+    positions,
+    headings,
+    ref_timestamp,
+    offsets,
+):
+    """Compute relative waypoints at arbitrary temporal offsets.
+
+    Args:
+        offsets: [M] offsets in seconds relative to ref_timestamp.
+                 Positive => future, negative => history.
+    Returns:
+        [M, 2] tensor in ego frame at ref_timestamp or None if unavailable.
+    """
     ref_pos = _interp_position(timestamps, positions, ref_timestamp)
     ref_heading = _interp_heading(timestamps, headings, ref_timestamp)
     if ref_pos is None or ref_heading is None:
         return None
 
-    # Compute rotation matrix for ego frame (inverse of reference heading)
     cos_h = np.cos(-ref_heading)
     sin_h = np.sin(-ref_heading)
     rot = np.array([[cos_h, -sin_h], [sin_h, cos_h]])
 
     waypoints = []
-    for i in range(1, horizon + 1):
-        t_future = ref_timestamp + i * dt
-        future_pos = _interp_position(timestamps, positions, t_future)
-        if future_pos is None:
+    for offset in offsets:
+        t_query = ref_timestamp + float(offset)
+        pos = _interp_position(timestamps, positions, t_query)
+        if pos is None:
             return None
-        # Transform to ego frame
-        delta = future_pos[:2] - ref_pos[:2]
+        delta = pos[:2] - ref_pos[:2]
         wp_ego = rot @ delta
         waypoints.append(wp_ego)
 

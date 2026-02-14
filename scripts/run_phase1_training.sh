@@ -44,6 +44,7 @@ EPOCHS_OVERRIDE=""
 BATCH_SIZE_OVERRIDE=""
 NUM_WORKERS_OVERRIDE=""
 DIST_BACKEND="${TORCH_DISTRIBUTED_BACKEND:-gloo}"
+DIST_BACKEND_USER_SET=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -85,6 +86,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --backend)
             DIST_BACKEND="$2"
+            DIST_BACKEND_USER_SET=1
             shift 2
             ;;
         -h|--help)
@@ -166,6 +168,21 @@ done
 if [[ ${#DEVICE_ARGS[@]} -eq 0 ]]; then
     echo "No valid GPUs provided." >&2
     exit 1
+fi
+
+if [[ "$DIST_BACKEND_USER_SET" -eq 0 ]]; then
+    all_cpu=1
+    for dev in "${DEVICE_ARGS[@]}"; do
+        if [[ "$dev" != "cpu" ]]; then
+            all_cpu=0
+            break
+        fi
+    done
+    if [[ "$all_cpu" -eq 1 ]]; then
+        DIST_BACKEND="gloo"
+    else
+        DIST_BACKEND="nccl"
+    fi
 fi
 
 RUN_FOLDER="${OUTPUT_ROOT}/${RUN_NAME}"

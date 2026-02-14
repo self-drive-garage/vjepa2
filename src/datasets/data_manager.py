@@ -117,6 +117,8 @@ def init_data(
             log_dir=log_dir,
             trajectory_horizon=kwargs.get("trajectory_horizon", 12),
             trajectory_dt=kwargs.get("trajectory_dt", 0.5),
+            trajectory_history_horizon=kwargs.get("trajectory_history_horizon", 8),
+            trajectory_history_dt=kwargs.get("trajectory_history_dt", 0.5),
             dataset_names=kwargs.get("dataset_names", None),
         )
 

@@ -43,6 +43,8 @@ import torch
 import yaml
 
 from app.vjepa.utils import init_video_model
+from app.vjepa_drive.inference import DrivingInferenceModel
+from app.vjepa_drive.runtime_safety import SafetyEnvelopeConfig
 from app.vjepa_drive.utils import _strip_module_prefix, init_trajectory_head
 
 LOGGER = logging.getLogger("export_trt_waypoints")
@@ -62,26 +64,28 @@ def resolve_device() -> torch.device:
 
 
 class DrivingWaypointModule(torch.nn.Module):
-    """Wrap encoder + trajectory head into a single forward graph."""
+    """Export wrapper supporting best-mode, safe, or full-distribution outputs."""
 
-    def __init__(self, encoder: torch.nn.Module, trajectory_head: torch.nn.Module):
+    def __init__(
+        self,
+        inference_model: DrivingInferenceModel,
+        export_mode: str,
+        include_ego_history: bool,
+    ):
         super().__init__()
-        self.encoder = encoder
-        self.trajectory_head = trajectory_head
-        self._input_dtype = next(encoder.parameters()).dtype
+        self.inference_model = inference_model
+        self.export_mode = export_mode
+        self.include_ego_history = include_ego_history
 
-    def forward(self, video: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            video: [B, 3, T, H, W] float tensor (or [B, 3, H, W] which will be treated as T=1)
-        Returns:
-            waypoints: [B, num_waypoints, 2]
-        """
-        if video.ndim == 4:
-            video = video.unsqueeze(2)
-        video = video.to(dtype=self._input_dtype)
-        features = self.encoder(video)
-        return self.trajectory_head(features)
+    def forward(self, video: torch.Tensor, ego_history: torch.Tensor | None = None):
+        if self.include_ego_history and ego_history is None:
+            raise ValueError("ego_history input is required when include_ego_history=True")
+        if self.export_mode == "distribution":
+            dist = self.inference_model.predict_distribution(video, ego_history=ego_history)
+            return dist.means, dist.log_stds, dist.mode_logits
+        apply_safety = self.export_mode == "safe"
+        traj, _, _ = self.inference_model.predict(video, ego_history=ego_history, apply_safety=apply_safety)
+        return traj
 
 
 class TensorRTWaypointExporter:
@@ -92,11 +96,6 @@ class TensorRTWaypointExporter:
         self.output_dir = Path(args.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        self.frames = args.frames or max(self.cfg["data"]["dataset_fpcs"])
-        crop_size = self.cfg["data"].get("crop_size", 224)
-        self.height = args.height or crop_size
-        self.width = args.width or crop_size
-
         self.sequence_index = args.sequence_index
         dataset_fpcs = self.cfg["data"]["dataset_fpcs"]
         if not (0 <= self.sequence_index < len(dataset_fpcs)):
@@ -104,6 +103,11 @@ class TensorRTWaypointExporter:
                 f"sequence-index {self.sequence_index} is invalid for dataset_fpcs={dataset_fpcs}"
             )
         self.seq_frames = dataset_fpcs[self.sequence_index]
+        self.frames = args.frames or self.seq_frames
+
+        crop_size = self.cfg["data"].get("crop_size", 224)
+        self.height = args.height or crop_size
+        self.width = args.width or crop_size
 
         if self.frames % self.cfg["data"]["tubelet_size"] != 0:
             raise ValueError(
@@ -113,6 +117,18 @@ class TensorRTWaypointExporter:
 
         if not (self.args.min_batch <= self.args.opt_batch <= self.args.max_batch):
             raise ValueError("Must satisfy min_batch <= opt_batch <= max_batch.")
+
+        self.export_mode = args.export_mode
+        self.include_ego_history = bool(args.include_ego_history or (self.export_mode == "safe"))
+        if self.export_mode == "safe" and not self.include_ego_history:
+            raise ValueError("Safe export mode requires ego-history input.")
+        self.history_tokens = int(
+            self.cfg.get("model", {})
+            .get("trajectory_head", {})
+            .get("history_tokens", self.cfg.get("data", {}).get("trajectory_history_horizon", 8))
+        )
+        self.trajectory_dt = float(self.cfg.get("data", {}).get("trajectory_dt", 0.5))
+        self.safety_cfg = SafetyEnvelopeConfig.from_cfg(self.cfg.get("runtime_safety", {}))
 
     def run(self) -> None:
         LOGGER.info("Building PyTorch module...")
@@ -173,21 +189,41 @@ class TensorRTWaypointExporter:
         traj_cfg = model_cfg.get("trajectory_head", {})
         trajectory_head = init_trajectory_head(
             embed_dim=encoder.embed_dim,
-            num_waypoints=traj_cfg.get("num_waypoints", 12),
+            num_waypoints=traj_cfg.get("num_waypoints", data_cfg.get("trajectory_horizon", 12)),
             waypoint_dim=traj_cfg.get("waypoint_dim", 2),
+            num_modes=traj_cfg.get("num_modes", 4),
+            history_dim=traj_cfg.get("history_dim", 2),
+            history_hidden_dim=traj_cfg.get("history_hidden_dim", None),
+            history_tokens=traj_cfg.get(
+                "history_tokens",
+                self.cfg.get("data", {}).get("trajectory_history_horizon", 8),
+            ),
             num_heads=traj_cfg.get("num_heads", 16),
             mlp_ratio=traj_cfg.get("mlp_ratio", 4.0),
             pooler_depth=traj_cfg.get("pooler_depth", 2),
+            min_log_std=traj_cfg.get("min_log_std", -4.0),
+            max_log_std=traj_cfg.get("max_log_std", 1.0),
             device=self.device,
             use_activation_checkpointing=False,
         )
         if "trajectory_head" in checkpoint:
             traj_state = _strip_module_prefix(checkpoint["trajectory_head"])
-            trajectory_head.load_state_dict(traj_state, strict=True)
+            msg = trajectory_head.load_state_dict(traj_state, strict=False)
+            LOGGER.info("Loaded trajectory_head with msg: %s", msg)
         else:
             LOGGER.warning("No trajectory_head weights in checkpoint; using randomly initialized head.")
 
-        return DrivingWaypointModule(encoder, trajectory_head)
+        inference_model = DrivingInferenceModel(
+            encoder=encoder,
+            trajectory_head=trajectory_head,
+            trajectory_dt=self.trajectory_dt,
+            safety_cfg=self.safety_cfg if self.export_mode == "safe" else None,
+        )
+        return DrivingWaypointModule(
+            inference_model=inference_model,
+            export_mode=self.export_mode,
+            include_ego_history=self.include_ego_history,
+        )
 
     def _export_onnx(self, module: DrivingWaypointModule, dtype: torch.dtype, onnx_path: Path) -> None:
         dummy = torch.randn(
@@ -199,12 +235,34 @@ class TensorRTWaypointExporter:
             device=self.device,
             dtype=dtype,
         )
+        inputs = [dummy]
         input_names = ["video"]
-        output_names = ["waypoints"]
-        dynamic_axes = {"video": {0: "batch"}, "waypoints": {0: "batch"}}
+        dynamic_axes = {"video": {0: "batch"}}
+
+        if self.include_ego_history:
+            dummy_hist = torch.randn(
+                self.args.opt_batch,
+                self.history_tokens,
+                2,
+                device=self.device,
+                dtype=dtype,
+            )
+            inputs.append(dummy_hist)
+            input_names.append("ego_history")
+            dynamic_axes["ego_history"] = {0: "batch", 1: "history_steps"}
+
+        if self.export_mode == "distribution":
+            output_names = ["traj_means", "traj_log_stds", "traj_mode_logits"]
+            dynamic_axes["traj_means"] = {0: "batch"}
+            dynamic_axes["traj_log_stds"] = {0: "batch"}
+            dynamic_axes["traj_mode_logits"] = {0: "batch"}
+        else:
+            output_names = ["waypoints"]
+            dynamic_axes["waypoints"] = {0: "batch"}
+
         torch.onnx.export(
             module,
-            dummy,
+            tuple(inputs) if len(inputs) > 1 else inputs[0],
             str(onnx_path),
             export_params=True,
             opset_version=self.args.opset,
@@ -245,6 +303,11 @@ class TensorRTWaypointExporter:
             opt_shape = (self.args.opt_batch, 3, self.frames, self.height, self.width)
             max_shape = (self.args.max_batch, 3, self.frames, self.height, self.width)
             profile.set_shape("video", min_shape, opt_shape, max_shape)
+            if self.include_ego_history:
+                min_hist = (self.args.min_batch, self.history_tokens, 2)
+                opt_hist = (self.args.opt_batch, self.history_tokens, 2)
+                max_hist = (self.args.max_batch, self.history_tokens, 2)
+                profile.set_shape("ego_history", min_hist, opt_hist, max_hist)
             config.add_optimization_profile(profile)
 
             if self.args.precision == "fp16":
@@ -278,6 +341,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workspace-gb", type=float, default=4.0, help="TensorRT workspace size in GB.")
     parser.add_argument("--opset", type=int, default=18, help="ONNX opset version.")
     parser.add_argument("--skip-engine", action="store_true", help="Only export ONNX; skip TensorRT build.")
+    parser.add_argument(
+        "--export-mode",
+        choices=("best_mode", "safe", "distribution"),
+        default="best_mode",
+        help="`best_mode`: top-probability trajectory, `safe`: apply runtime safety envelope, `distribution`: export means/stds/logits.",
+    )
+    parser.add_argument(
+        "--include-ego-history",
+        action="store_true",
+        help="Export a second input `ego_history` with shape [B, H, 2]. Required for safe mode.",
+    )
     parser.add_argument(
         "--sequence-index",
         type=int,
