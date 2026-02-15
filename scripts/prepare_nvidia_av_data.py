@@ -17,6 +17,7 @@ Usage:
 Requires:
     - physical_ai_av devkit installed (pip install -e physical_ai_av/)
     - HuggingFace token at /localhome/local-samehm/.hugging_face_token
+    - Optional override: VJEPA_HF_CACHE_DIR=/path/to/cache
 """
 
 import argparse
@@ -44,7 +45,8 @@ DATA_ROOT = PROJECT_ROOT / "data" / "nvidia_av"
 VIDEO_DIR = DATA_ROOT / "videos"
 EGOMOTION_DIR = DATA_ROOT / "egomotion"
 TRAIN_CSV_PATH = DATA_ROOT / "train.csv"
-HF_CACHE_DIR = str(PROJECT_ROOT / "hf_cache")
+HF_CACHE_ENV_VAR = "VJEPA_HF_CACHE_DIR"
+LEGACY_HF_CACHE_DIR = PROJECT_ROOT / "hf_cache"
 
 FEATURES_TO_DOWNLOAD = ["camera_front_wide_120fov", "egomotion"]
 
@@ -67,6 +69,20 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 logger = logging.getLogger("prepare_nvidia_av_data")
+
+
+def resolve_hf_cache_dir() -> pathlib.Path:
+    """Resolve Hugging Face cache dir, preferring a RAM disk when available."""
+    override = os.environ.get(HF_CACHE_ENV_VAR, "").strip()
+    if override:
+        return pathlib.Path(override).expanduser()
+
+    shm_root = pathlib.Path("/dev/shm")
+    if shm_root.exists() and os.access(shm_root, os.W_OK):
+        user = os.environ.get("USER", "user")
+        return shm_root / user / "vjepa2_hf_cache"
+
+    return LEGACY_HF_CACHE_DIR
 
 
 def resolve_temporal_recipe() -> TemporalRecipe:
@@ -96,6 +112,7 @@ def resolve_temporal_recipe() -> TemporalRecipe:
 
 
 # Temporal recipe shared with training.
+HF_CACHE_DIR = resolve_hf_cache_dir()
 TEMPORAL_RECIPE = resolve_temporal_recipe()
 CLIP_DURATION_SEC = TEMPORAL_RECIPE.clip_duration_sec
 HISTORY_MARGIN_SEC = TEMPORAL_RECIPE.history_margin_sec
@@ -129,7 +146,7 @@ def estimate_num_clips(avail_clip_count: int) -> tuple[int, int, int]:
         DATA_ROOT,
         VIDEO_DIR,
         EGOMOTION_DIR,
-        pathlib.Path(HF_CACHE_DIR),
+        HF_CACHE_DIR,
     ]
     total_free = _bytes_free_across_paths(candidates)
     usable_bytes = max(total_free - reserve_bytes, 0)
@@ -368,6 +385,12 @@ def main(args: argparse.Namespace):
     logger.info("=" * 70)
     logger.info("NVIDIA Physical AI AV Data Preparation for V-JEPA2")
     logger.info("=" * 70)
+    HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    logger.info(
+        "Using Hugging Face cache dir: %s (override with %s)",
+        HF_CACHE_DIR,
+        HF_CACHE_ENV_VAR,
+    )
 
     ds = None
 
@@ -397,7 +420,7 @@ def main(args: argparse.Namespace):
 
         ds = PhysicalAIAVDatasetInterface(
             token=token,
-            cache_dir=HF_CACHE_DIR,
+            cache_dir=str(HF_CACHE_DIR),
             confirm_download_threshold_gb=float("inf"),
         )
         logger.info(f"  Dataset interface initialized: {ds}")
@@ -479,8 +502,6 @@ def main(args: argparse.Namespace):
                 for row_id, row in train_row_map.items()
                 if row.get("clip_id", pathlib.Path(row["video_path"]).stem) == clip_id
             ]
-            for row_id in existing_row_keys:
-                train_row_map.pop(row_id, None)
             if video_exists and ego_exists:
                 logger.info("  Local video + ego CSV found. Skipping download and extraction.")
                 reused_local_assets += 1
@@ -515,7 +536,8 @@ def main(args: argparse.Namespace):
                         )
                         save_video(video_bytes, video_path)
 
-                if not video_path.exists() or not ego_csv_path.exists():
+                if not video_path.exists():
+                    logger.info("  Video missing for clip %s after processing; skipping.", clip_id)
                     continue
 
             # Extract ego-motion at frame timestamps and save CSV
@@ -560,7 +582,8 @@ def main(args: argparse.Namespace):
                 ego_end,
             )
 
-            remaining = MAX_SAMPLES_CAP - len(train_row_map)
+            # Treat this clip's existing rows as replaceable budget.
+            remaining = MAX_SAMPLES_CAP - (len(train_row_map) - len(existing_row_keys))
             if remaining <= 0:
                 logger.info("  No sample budget remaining. Skipping window writes.")
                 break
@@ -572,6 +595,9 @@ def main(args: argparse.Namespace):
                 )
                 clip_windows = clip_windows[:remaining]
 
+            # Replace rows atomically only after successful clip processing.
+            for row_id in existing_row_keys:
+                train_row_map.pop(row_id, None)
             for clip_start_time, clip_end_time in clip_windows:
                 row_id = make_row_id(clip_id, clip_start_time, clip_end_time)
                 train_row_map[row_id] = {

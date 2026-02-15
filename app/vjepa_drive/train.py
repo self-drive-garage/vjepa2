@@ -349,7 +349,7 @@ def main(args, resume_preempt=False):
 
     start_epoch = 0
     # -- load training checkpoint
-    if load_model or os.path.exists(latest_path):
+    if load_model:
         (
             encoder,
             predictor,
