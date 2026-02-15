@@ -64,6 +64,7 @@ def make_drivingvideodataset(
     trajectory_history_horizon=8,
     trajectory_history_dt=0.5,
     dataset_names=None,
+    max_resample_attempts=64,
 ):
     dataset = DrivingVideoDataset(
         data_paths=data_paths,
@@ -85,6 +86,7 @@ def make_drivingvideodataset(
         trajectory_history_horizon=trajectory_history_horizon,
         trajectory_history_dt=trajectory_history_dt,
         dataset_names=dataset_names,
+        max_resample_attempts=max_resample_attempts,
     )
 
     log_dir = pathlib.Path(log_dir) if log_dir else None
@@ -174,6 +176,7 @@ class DrivingVideoDataset(torch.utils.data.Dataset):
         trajectory_history_horizon=8,
         trajectory_history_dt=0.5,
         dataset_names=None,
+        max_resample_attempts=64,
     ):
         self.data_paths = data_paths
         self.datasets_weights = datasets_weights
@@ -191,6 +194,7 @@ class DrivingVideoDataset(torch.utils.data.Dataset):
         self.trajectory_dt = trajectory_dt
         self.trajectory_history_horizon = trajectory_history_horizon
         self.trajectory_history_dt = trajectory_history_dt
+        self.max_resample_attempts = int(max(1, max_resample_attempts))
 
         if sum([v is not None for v in (fps, duration, frame_step)]) != 1:
             raise ValueError(f"Must specify exactly one of either {fps=}, {duration=}, or {frame_step=}.")
@@ -250,16 +254,23 @@ class DrivingVideoDataset(torch.utils.data.Dataset):
         return self._ego_loaders[dataset_name]
 
     def __getitem__(self, index):
-        sample = self.samples[index]
-        loaded_sample = False
+        if self.__len__() == 0:
+            raise RuntimeError("DrivingVideoDataset is empty; check data_paths and CSV contents.")
 
-        while not loaded_sample:
-            loaded_sample = self._get_item(index)
-            if not loaded_sample:
-                index = np.random.randint(self.__len__())
-                sample = self.samples[index]
+        cur_index = int(index)
+        for _ in range(self.max_resample_attempts):
+            loaded_sample = self._get_item(cur_index)
+            if loaded_sample is not None:
+                return loaded_sample
+            cur_index = int(np.random.randint(self.__len__()))
 
-        return loaded_sample
+        failed_sample = self.samples[cur_index]
+        raise RuntimeError(
+            "Exceeded max_resample_attempts when loading driving sample. "
+            f"max_resample_attempts={self.max_resample_attempts} "
+            f"last_video={failed_sample.get('video_path')} "
+            f"last_ego={failed_sample.get('ego_path')}"
+        )
 
     def _get_item(self, index):
         sample = self.samples[index]
@@ -354,6 +365,22 @@ class DrivingVideoDataset(torch.utils.data.Dataset):
             return [], None, None
         clip_len = int(fpc * fstp)
 
+        def _frame_idx_to_timestamp_seconds(frame_idx: int) -> float:
+            frame_idx = int(frame_idx)
+            try:
+                ts = vr.get_frame_timestamp(frame_idx)
+                if isinstance(ts, np.ndarray):
+                    ts = float(ts.reshape(-1)[0])
+                elif isinstance(ts, (list, tuple)):
+                    ts = float(ts[0])
+                else:
+                    ts = float(ts)
+                if np.isfinite(ts):
+                    return ts
+            except Exception:
+                pass
+            return float(frame_idx) / video_fps
+
         if self.filter_short_videos and len(vr) < clip_len:
             warnings.warn(f"skipping video of length {len(vr)}")
             return [], None, None
@@ -383,7 +410,7 @@ class DrivingVideoDataset(torch.utils.data.Dataset):
                     indices = np.clip(np.round(indices), start_idx, end_idx).astype(np.int64)
                 clip_indices = [indices]
                 buffer = vr.get_batch(indices.tolist()).asnumpy()
-                sampled_clip_end_time = float(indices[-1]) / video_fps
+                sampled_clip_end_time = _frame_idx_to_timestamp_seconds(indices[-1])
                 return buffer, clip_indices, sampled_clip_end_time
 
         partition_len = len(vr) // self.num_clips
@@ -423,7 +450,7 @@ class DrivingVideoDataset(torch.utils.data.Dataset):
             all_indices.extend(list(indices))
 
         buffer = vr.get_batch(all_indices).asnumpy()
-        sampled_clip_end_time = float(clip_indices[-1][-1]) / video_fps
+        sampled_clip_end_time = _frame_idx_to_timestamp_seconds(clip_indices[-1][-1])
         return buffer, clip_indices, sampled_clip_end_time
 
     def __len__(self):

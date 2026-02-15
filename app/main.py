@@ -6,6 +6,7 @@
 import argparse
 import multiprocessing as mp
 import pprint
+import sys
 from pathlib import Path
 
 import yaml
@@ -80,5 +81,29 @@ if __name__ == "__main__":
     else:
         num_gpus = len(args.devices)
         mp.set_start_method("spawn")
+        procs = []
         for rank in range(num_gpus):
-            mp.Process(target=process_main, args=(rank, args.fname, num_gpus, args.devices)).start()
+            proc = mp.Process(target=process_main, args=(rank, args.fname, num_gpus, args.devices))
+            proc.start()
+            procs.append(proc)
+
+        exit_code = 0
+        failed_pid = None
+        for proc in procs:
+            proc.join()
+            if proc.exitcode not in (0, None):
+                exit_code = proc.exitcode if proc.exitcode is not None else 1
+                failed_pid = proc.pid
+                break
+
+        if failed_pid is not None:
+            for proc in procs:
+                if proc.is_alive():
+                    proc.terminate()
+            for proc in procs:
+                proc.join(timeout=5)
+            raise SystemExit(
+                f"Distributed training worker exited with a non-zero code (pid={failed_pid}, exit_code={exit_code})."
+            )
+
+        sys.exit(0)

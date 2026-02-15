@@ -41,6 +41,7 @@ class ModelConfig:
     wide_silu: bool
     compile_model: bool
     use_activation_checkpointing: bool
+    predictor_find_unused_parameters: bool
     traj_cfg: dict
 
 
@@ -59,6 +60,7 @@ class DataConfig:
     num_workers: int
     persistent_workers: bool
     dataset_names: list[str] | None
+    max_resample_attempts: int
     temporal_recipe: TemporalRecipe
 
 
@@ -150,6 +152,7 @@ def parse_train_sections(args: dict, resume_preempt: bool = False) -> TrainSecti
         wide_silu=bool(cfgs_model.get("wide_silu", True)),
         compile_model=bool(cfgs_model.get("compile_model", False)),
         use_activation_checkpointing=bool(cfgs_model.get("use_activation_checkpointing", False)),
+        predictor_find_unused_parameters=bool(cfgs_model.get("predictor_find_unused_parameters", True)),
         traj_cfg=cfgs_model.get("trajectory_head", {}),
     )
 
@@ -167,6 +170,7 @@ def parse_train_sections(args: dict, resume_preempt: bool = False) -> TrainSecti
         num_workers=int(cfgs_data.get("num_workers", 1)),
         persistent_workers=bool(cfgs_data.get("persistent_workers", True)),
         dataset_names=cfgs_data.get("dataset_names", None),
+        max_resample_attempts=int(cfgs_data.get("max_resample_attempts", 64)),
         temporal_recipe=TemporalRecipe.from_data_cfg(cfgs_data),
     )
 

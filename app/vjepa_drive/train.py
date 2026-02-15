@@ -70,6 +70,7 @@ def main(args, resume_preempt=False):
     cfgs_traj = sections.model.traj_cfg
     compile_model = sections.model.compile_model
     use_activation_checkpointing = sections.model.use_activation_checkpointing
+    predictor_find_unused_parameters = sections.model.predictor_find_unused_parameters
     model_name = sections.model.model_name
     pred_depth = sections.model.pred_depth
     pred_num_heads = sections.model.pred_num_heads
@@ -114,6 +115,7 @@ def main(args, resume_preempt=False):
     trajectory_history_horizon = sections.data.temporal_recipe.history_horizon
     trajectory_history_dt = sections.data.temporal_recipe.history_dt
     dataset_names = sections.data.dataset_names
+    max_resample_attempts = sections.data.max_resample_attempts
 
     cfgs_data_aug = sections.data_aug
     ar_range = cfgs_data_aug.get("random_resize_aspect_ratio", [3 / 4, 4 / 3])
@@ -287,6 +289,7 @@ def main(args, resume_preempt=False):
         trajectory_history_horizon=trajectory_history_horizon,
         trajectory_history_dt=trajectory_history_dt,
         dataset_names=dataset_names,
+        max_resample_attempts=max_resample_attempts,
     )
     try:
         _dlen = len(unsupervised_loader)
@@ -317,8 +320,16 @@ def main(args, resume_preempt=False):
         encoder_lr_scale=encoder_lr_scale,
     )
     if torch.distributed.is_available() and torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        logger.info(
+            "Wrapping models with DDP (predictor_find_unused_parameters=%s)",
+            predictor_find_unused_parameters,
+        )
         encoder = DistributedDataParallel(encoder, static_graph=True)
-        predictor = DistributedDataParallel(predictor, static_graph=False, find_unused_parameters=True)
+        predictor = DistributedDataParallel(
+            predictor,
+            static_graph=False,
+            find_unused_parameters=predictor_find_unused_parameters,
+        )
         trajectory_head = DistributedDataParallel(trajectory_head, static_graph=True)
         target_encoder = DistributedDataParallel(target_encoder)
     else:

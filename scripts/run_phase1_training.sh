@@ -10,13 +10,14 @@ usage() {
 Usage: scripts/run_phase1_training.sh [options]
 
 Options:
-  -c, --config FILE          Base YAML config (default: configs/train/vitg16/driving-joint-256px-16f.yaml)
+  -c, --config FILE          Base YAML config (default: configs/train/vitg16/driving-joint-256px-16f-8xa100.yaml)
   -o, --output-root DIR      Root directory for run folders (default: <repo>/logs/vjepa_drive)
   -n, --run-name NAME        Name of this run (default: phase1-YYYYmmdd-HHMMSS)
-  -g, --gpus LIST            Comma-separated GPU identifiers (e.g. 0,1 or cuda:0,cuda:1; default: 0)
+  -g, --gpus LIST            Comma-separated GPU identifiers (e.g. 0,1 or cuda:0,cuda:1; default: 0,1,2,3,4,5,6,7)
   -d, --datasets SPECS       Comma-separated dataset specs name:path (default: nvidia_av:<repo>/data/nvidia_av/train.csv)
   -p, --pretrained CKPT      Path to pretrained V-JEPA2 checkpoint to initialize from
   -e, --epochs N             Override total training epochs in config
+  --ipe N                    Override iterations-per-epoch (for short benchmark runs)
   -b, --batch-size N         Override batch size in config
   -w, --num-workers N        Override DataLoader worker count (disables pin_mem when set)
   --backend NAME            Distributed backend (nccl|gloo|mpi); default respects
@@ -34,13 +35,14 @@ USAGE
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-CONFIG_TEMPLATE="${PROJECT_ROOT}/configs/train/vitg16/driving-joint-256px-16f.yaml"
+CONFIG_TEMPLATE="${PROJECT_ROOT}/configs/train/vitg16/driving-joint-256px-16f-8xa100.yaml"
 OUTPUT_ROOT="${PROJECT_ROOT}/logs/vjepa_drive"
 RUN_NAME="phase1-$(date +%Y%m%d-%H%M%S)"
-GPU_STRING="0"
+GPU_STRING="0,1,2,3,4,5,6,7"
 DATASET_SPECS="nvidia_av:${PROJECT_ROOT}/data/nvidia_av/train.csv"
 PRETRAIN_CKPT=""
 EPOCHS_OVERRIDE=""
+IPE_OVERRIDE=""
 BATCH_SIZE_OVERRIDE=""
 NUM_WORKERS_OVERRIDE=""
 DIST_BACKEND="${TORCH_DISTRIBUTED_BACKEND:-gloo}"
@@ -74,6 +76,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -e|--epochs)
             EPOCHS_OVERRIDE="$2"
+            shift 2
+            ;;
+        --ipe)
+            IPE_OVERRIDE="$2"
             shift 2
             ;;
         -b|--batch-size)
@@ -198,6 +204,7 @@ export PHASE1_RUN_FOLDER="$RUN_FOLDER"
 export PHASE1_DATASETS="$DATASET_SPEC_JOINED"
 export PHASE1_PRETRAIN="${PRETRAIN_CKPT}"
 export PHASE1_EPOCHS="${EPOCHS_OVERRIDE}"
+export PHASE1_IPE="${IPE_OVERRIDE}"
 export PHASE1_BATCH_SIZE="${BATCH_SIZE_OVERRIDE}"
 export PHASE1_NUM_WORKERS="${NUM_WORKERS_OVERRIDE}"
 
@@ -213,6 +220,7 @@ run_folder = os.environ["PHASE1_RUN_FOLDER"]
 dataset_specs = [spec for spec in os.environ["PHASE1_DATASETS"].split(",") if spec]
 pretrained = os.environ.get("PHASE1_PRETRAIN", "")
 epochs_override = os.environ.get("PHASE1_EPOCHS")
+ipe_override = os.environ.get("PHASE1_IPE")
 batch_override = os.environ.get("PHASE1_BATCH_SIZE")
 workers_override = os.environ.get("PHASE1_NUM_WORKERS")
 
@@ -244,6 +252,9 @@ if workers_override:
 if epochs_override:
     cfg.setdefault("optimization", {})
     cfg["optimization"]["epochs"] = int(epochs_override)
+if ipe_override:
+    cfg.setdefault("optimization", {})
+    cfg["optimization"]["ipe"] = int(ipe_override)
 
 cfg.setdefault("meta", {})
 if pretrained:
@@ -279,4 +290,11 @@ export TMPDIR=/tmp
 export TMP=/tmp
 export TEMP=/tmp
 export TORCH_DISTRIBUTED_BACKEND="$DIST_BACKEND"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-4}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export NCCL_ASYNC_ERROR_HANDLING="${NCCL_ASYNC_ERROR_HANDLING:-1}"
+export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 PYTHONPATH="$PROJECT_ROOT:${PYTHONPATH:-}" python3 -m app.main --fname "$RUN_CONFIG_PATH" --devices "${DEVICE_ARGS[@]}" 2>&1 | tee "$CONSOLE_LOG"

@@ -162,7 +162,7 @@ def run_training_epoch(
             else:
                 loss.backward()
                 optimizer.step()
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
             momentum_value = next(momentum_scheduler)
             _update_target_encoder(encoder, target_encoder, momentum_value)

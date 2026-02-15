@@ -17,6 +17,7 @@ data:
   num_workers: 8
   pin_mem: true
   persistent_workers: true
+  max_resample_attempts: 64
   trajectory_horizon: 12
   trajectory_dt: 0.5
   trajectory_history_horizon: 8
