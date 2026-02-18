@@ -13,6 +13,7 @@ import math
 import os
 import pathlib
 import warnings
+from collections import OrderedDict
 from logging import getLogger
 
 import numpy as np
@@ -65,6 +66,9 @@ def make_drivingvideodataset(
     trajectory_history_dt=0.5,
     dataset_names=None,
     max_resample_attempts=64,
+    prefetch_factor=2,
+    decord_num_threads=2,
+    ego_cache_size=512,
 ):
     dataset = DrivingVideoDataset(
         data_paths=data_paths,
@@ -87,6 +91,8 @@ def make_drivingvideodataset(
         trajectory_history_dt=trajectory_history_dt,
         dataset_names=dataset_names,
         max_resample_attempts=max_resample_attempts,
+        decord_num_threads=decord_num_threads,
+        ego_cache_size=ego_cache_size,
     )
 
     log_dir = pathlib.Path(log_dir) if log_dir else None
@@ -108,27 +114,26 @@ def make_drivingvideodataset(
             dataset, num_replicas=world_size, rank=rank, shuffle=True
         )
 
+    loader_kwargs = {
+        "dataset": dataset,
+        "collate_fn": collator,
+        "sampler": dist_sampler,
+        "batch_size": batch_size,
+        "drop_last": drop_last,
+        "pin_memory": pin_mem,
+        "num_workers": num_workers,
+        "persistent_workers": (num_workers > 0) and persistent_workers,
+    }
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = max(1, int(prefetch_factor))
+
     if deterministic:
         data_loader = torch.utils.data.DataLoader(
-            dataset,
-            collate_fn=collator,
-            sampler=dist_sampler,
-            batch_size=batch_size,
-            drop_last=drop_last,
-            pin_memory=pin_mem,
-            num_workers=num_workers,
-            persistent_workers=(num_workers > 0) and persistent_workers,
+            **loader_kwargs,
         )
     else:
         data_loader = NondeterministicDataLoader(
-            dataset,
-            collate_fn=collator,
-            sampler=dist_sampler,
-            batch_size=batch_size,
-            drop_last=drop_last,
-            pin_memory=pin_mem,
-            num_workers=num_workers,
-            persistent_workers=(num_workers > 0) and persistent_workers,
+            **loader_kwargs,
         )
     logger.info("DrivingVideoDataset data loader created")
 
@@ -177,6 +182,8 @@ class DrivingVideoDataset(torch.utils.data.Dataset):
         trajectory_history_dt=0.5,
         dataset_names=None,
         max_resample_attempts=64,
+        decord_num_threads=2,
+        ego_cache_size=512,
     ):
         self.data_paths = data_paths
         self.datasets_weights = datasets_weights
@@ -195,6 +202,8 @@ class DrivingVideoDataset(torch.utils.data.Dataset):
         self.trajectory_history_horizon = trajectory_history_horizon
         self.trajectory_history_dt = trajectory_history_dt
         self.max_resample_attempts = int(max(1, max_resample_attempts))
+        self.decord_num_threads = int(max(1, decord_num_threads))
+        self.ego_cache_size = int(max(0, ego_cache_size))
 
         if sum([v is not None for v in (fps, duration, frame_step)]) != 1:
             raise ValueError(f"Must specify exactly one of either {fps=}, {duration=}, or {frame_step=}.")
@@ -247,11 +256,29 @@ class DrivingVideoDataset(torch.utils.data.Dataset):
 
         # Cache ego-motion loaders by dataset name
         self._ego_loaders = {}
+        # Repeated clip windows often share the same ego file; memoize parsed state per worker.
+        self._ego_state_cache = OrderedDict()
 
     def _get_ego_loader(self, dataset_name):
         if dataset_name not in self._ego_loaders:
             self._ego_loaders[dataset_name] = get_ego_motion_loader(dataset_name)
         return self._ego_loaders[dataset_name]
+
+    def _load_ego_motion(self, sample):
+        ego_path = sample["ego_path"]
+        dataset_name = sample["dataset_name"]
+
+        if self.ego_cache_size > 0 and ego_path in self._ego_state_cache:
+            self._ego_state_cache.move_to_end(ego_path)
+            return self._ego_state_cache[ego_path]
+
+        ego_loader = self._get_ego_loader(dataset_name)
+        ego_state = ego_loader.load(ego_path)
+        if self.ego_cache_size > 0:
+            self._ego_state_cache[ego_path] = ego_state
+            if len(self._ego_state_cache) > self.ego_cache_size:
+                self._ego_state_cache.popitem(last=False)
+        return ego_state
 
     def __getitem__(self, index):
         if self.__len__() == 0:
@@ -286,8 +313,7 @@ class DrivingVideoDataset(torch.utils.data.Dataset):
 
         # Load ego-motion and compute trajectory
         try:
-            ego_loader = self._get_ego_loader(sample["dataset_name"])
-            timestamps, positions, headings = ego_loader.load(sample["ego_path"])
+            timestamps, positions, headings = self._load_ego_motion(sample)
             gt_trajectory = compute_future_waypoints_from_poses(
                 timestamps=timestamps,
                 positions=positions,
@@ -342,7 +368,7 @@ class DrivingVideoDataset(torch.utils.data.Dataset):
             return [], None, None
 
         try:
-            vr = VideoReader(fname, num_threads=-1, ctx=cpu(0))
+            vr = VideoReader(fname, num_threads=self.decord_num_threads, ctx=cpu(0))
         except Exception:
             return [], None, None
 

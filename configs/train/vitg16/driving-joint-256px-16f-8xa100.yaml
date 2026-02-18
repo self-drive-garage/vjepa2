@@ -17,6 +17,10 @@ data:
   num_workers: 12
   pin_mem: true
   persistent_workers: true
+  deterministic_loader: false
+  prefetch_factor: 4
+  decord_num_threads: 2
+  ego_cache_size: 2048
   max_resample_attempts: 64
   trajectory_horizon: 12
   trajectory_dt: 0.5
@@ -39,7 +43,7 @@ model:
   use_rope: true
   use_silu: false
   wide_silu: false
-  compile_model: false
+  compile_model: true
   use_activation_checkpointing: true
   predictor_find_unused_parameters: false
   trajectory_head:

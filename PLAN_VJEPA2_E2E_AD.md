@@ -35,8 +35,8 @@ Driving Video → Encoder(θ) → Latent z
               (masked latent          (waypoint prediction)
                prediction)
                     |                       |
-              L_jepa = L1(z_hat,      L_traj = minADE(
-                sg(z_target))           waypoints, gt_ego)
+              L_jepa = L1(z_hat,      L_traj = composite(
+                sg(z_target))           ADE/FDE/NLL/calib/...
                     |                       |
                     +-----------+-----------+
                                 |
@@ -66,8 +66,7 @@ This creates representations that are **inherently planning-aware** — they enc
 │  ┌─────────────┐                                  │
 │  │  V-JEPA2    │──── z_masked ──→ Predictor(φ)    │
 │  │  Encoder(θ) │                   → L_jepa       │
-│  │  (ViT-L on  │                                  │
-│  │  8×A40,     │                                  │
+│  │  (ViT-L,    │                                  │
 │  │  scale→ViT-g│                                  │
 │  │             │──── z_full ────→ TrajectoryHead(ψ)│
 │  │  TRAINABLE  │                   → L_traj       │
@@ -77,7 +76,7 @@ This creates representations that are **inherently planning-aware** — they enc
 └──────────────────────────────────────────────────┘
 ```
 
-**Encoder** (`VisionTransformer`): We start on the pretrained V-JEPA2 **ViT-L** encoder to fit comfortably on the available 8× A40 GPUs while keeping the encoder **trainable** end-to-end. The design remains compatible with ViT-g, which we will scale to once we switch onto higher-memory hardware.
+**Encoder** (`VisionTransformer`): We start on the pretrained V-JEPA2 **ViT-L** encoder while keeping it **trainable** end-to-end. The design remains compatible with larger encoders for later scaling.
 
 **Predictor** (`VisionTransformerPredictor`): The existing V-JEPA2 predictor. Takes masked encoder features and predicts target features at masked positions. Unchanged from V-JEPA2.
 
@@ -93,43 +92,57 @@ The trajectory head should be lightweight so it doesn't dominate the encoder's r
 # New: src/models/trajectory_head.py
 
 class TrajectoryHead(nn.Module):
-    """Predicts ego-vehicle waypoints from V-JEPA2 encoder features.
+    """Predict multimodal future trajectories from V-JEPA2 encoder features.
 
-    Uses AttentivePooler (existing V-JEPA2 component) to aggregate
-    spatiotemporal tokens into a compact representation, then
-    projects to waypoints.
+    Reuses AttentivePooler to aggregate encoder tokens and outputs a
+    distribution with K modes:
+      means      [B, K, T, 2]
+      log_stds   [B, K, T, 2]
+      mode_logits [B, K]
     """
 
     def __init__(
         self,
         embed_dim=1024,        # ViT-L dimension (switch to 1408 for ViT-g)
+        num_modes=4,
         num_waypoints=12,      # e.g., 6 seconds at 2Hz
         waypoint_dim=2,        # (x, y) in ego frame
         num_heads=16,
         pooler_depth=2,
     ):
         super().__init__()
+        self.num_modes = num_modes
         self.num_waypoints = num_waypoints
 
         # Reuse V-JEPA2's AttentivePooler pattern
         self.pooler = AttentivePooler(
-            num_queries=num_waypoints,
+            num_queries=num_modes * num_waypoints,
             embed_dim=embed_dim,
             num_heads=num_heads,
             depth=pooler_depth,
         )
-        self.waypoint_proj = nn.Linear(embed_dim, waypoint_dim)
+        self.mean_proj = nn.Linear(embed_dim, waypoint_dim)
+        self.log_std_proj = nn.Linear(embed_dim, waypoint_dim)
+        self.mode_logit_proj = nn.Linear(embed_dim, 1)
 
-    def forward(self, encoder_features):
+    def predict_distribution(self, encoder_features, ego_history=None):
         """
         Args:
             encoder_features: [B, N, D] - full (unmasked) encoder output
+            ego_history: [B, H, 2] optional past ego waypoints
         Returns:
-            waypoints: [B, num_waypoints, waypoint_dim]
+            distribution over K trajectory modes
         """
-        queries = self.pooler(encoder_features)      # [B, num_waypoints, D]
-        waypoints = self.waypoint_proj(queries)       # [B, num_waypoints, 2]
-        return waypoints
+        batch_size = encoder_features.size(0)
+        embed_dim = encoder_features.size(-1)
+        queries = self.pooler(encoder_features)  # [B, K*T, D]
+        queries = queries.view(
+            batch_size, self.num_modes, self.num_waypoints, embed_dim
+        )
+        means = self.mean_proj(queries)
+        log_stds = self.log_std_proj(queries)
+        mode_logits = self.mode_logit_proj(queries.mean(dim=2)).squeeze(-1)
+        return TrajectoryDistribution(means, log_stds, mode_logits)
 ```
 
 **Why AttentivePooler**: It's already part of V-JEPA2's codebase (`src/models/attentive_pooler.py`), proven to work with V-JEPA2 features, and provides a clean cross-attention mechanism where learnable query tokens attend to the encoder's spatiotemporal features.
@@ -138,7 +151,7 @@ class TrajectoryHead(nn.Module):
 
 ```python
 def forward_step(encoder, target_encoder, predictor, trajectory_head,
-                 video_clip, masks_enc, masks_pred, gt_trajectory):
+                 video_clip, masks_enc, masks_pred, gt_trajectory, ego_history, trajectory_dt):
     """
     Single training step for V-JEPA2-Drive.
     Both JEPA loss and trajectory loss backpropagate through encoder.
@@ -164,11 +177,14 @@ def forward_step(encoder, target_encoder, predictor, trajectory_head,
     # Encode FULL (unmasked) video for trajectory prediction
     z_full = encoder(video_clip)  # [B, N, D] — no masking
 
-    # Predict waypoints
-    pred_waypoints = trajectory_head(z_full)  # [B, T_waypoints, 2]
+    # Predict multimodal trajectory distribution
+    pred_dist = trajectory_head.predict_distribution(z_full, ego_history=ego_history)
 
-    # Trajectory loss: minADE
-    loss_traj = min_ade_loss(pred_waypoints, gt_trajectory)
+    # Trajectory loss: composite multimodal objective
+    traj_stats = compute_multimodal_trajectory_losses(
+        pred_dist, gt_trajectory, trajectory_dt
+    )
+    loss_traj = traj_stats["loss"]
 
     # === Combined Loss ===
     loss = loss_jepa + lambda_traj * loss_traj
@@ -196,63 +212,48 @@ This avoids the double forward pass entirely.
 
 ## 3. Loss Functions
 
-### 3.1 Phase 1: Minimum Average Displacement Error (minADE)
+### 3.1 Composite Multimodal Trajectory Objective (Current)
 
-Start simple. The trajectory loss is the minimum ADE across predicted waypoints:
+Trajectory learning now uses a multimodal distribution objective rather than minADE alone. The head predicts:
+- `means`: `[B, K, T, 2]`
+- `log_stds`: `[B, K, T, 2]`
+- `mode_logits`: `[B, K]`
+
+Loss terms are computed in `app/vjepa_drive/losses.py` and combined as:
 
 ```python
-def min_ade_loss(pred_waypoints, gt_waypoints):
-    """
-    Args:
-        pred_waypoints: [B, T, 2] predicted (x, y) waypoints in ego frame
-        gt_waypoints:   [B, T, 2] ground truth from ego-motion data
-    Returns:
-        scalar loss
-    """
-    # ADE = mean L2 distance across all waypoints
-    displacement = torch.norm(pred_waypoints - gt_waypoints, dim=-1)  # [B, T]
-    ade = displacement.mean(dim=-1)  # [B]
-    return ade.mean()
+loss_traj = (
+    w_ade * min_ade
+    + w_fde * min_fde
+    + w_nll * nll
+    + w_calib * calib
+    + w_smooth * smoothness
+    + w_feas * feasibility
+)
 ```
+
+Where:
+- `min_ade`, `min_fde`: best-mode displacement errors
+- `nll`: multimodal Gaussian mixture negative log-likelihood
+- `calib`: predicted variance calibration against squared error
+- `smoothness`: jerk penalty
+- `feasibility`: speed/acceleration limit penalty
 
 Ground truth waypoints come from the ego-motion data in driving datasets:
-- **NVIDIA AV**: `EgomotionState` with pose, velocity, acceleration interpolators
-- **nuScenes**: ego_pose annotations at each keyframe
-- **Argoverse v2**: ego-vehicle trajectory logs
-- **Waymo**: vehicle pose in each frame
+- **NVIDIA AV**: `EgomotionState` with pose/kinematics interpolation
+- **nuScenes**: ego-pose annotations
+- **Argoverse v2**: ego trajectory logs
+- **Waymo**: per-frame vehicle pose
 
-### 3.2 Future Cost Functions (Later Phases)
+### 3.2 JEPA + Trajectory Coupling
 
-Once the basic joint training works, additional cost functions can be added:
+The total training objective remains:
 
 ```python
-def trajectory_cost(pred_waypoints, gt_waypoints, curvature=None):
-    """Composite trajectory cost with multiple terms."""
-
-    # 1. Displacement error (primary)
-    loss_ade = min_ade_loss(pred_waypoints, gt_waypoints)
-
-    # 2. Comfort: penalize high jerk (third derivative)
-    velocity = pred_waypoints[:, 1:] - pred_waypoints[:, :-1]
-    acceleration = velocity[:, 1:] - velocity[:, :-1]
-    jerk = acceleration[:, 1:] - acceleration[:, :-1]
-    loss_comfort = torch.norm(jerk, dim=-1).mean()
-
-    # 3. Smoothness: penalize large curvature changes
-    loss_smooth = torch.norm(acceleration, dim=-1).mean()
-
-    # 4. Final Displacement Error (FDE): accuracy at planning horizon
-    loss_fde = torch.norm(
-        pred_waypoints[:, -1] - gt_waypoints[:, -1], dim=-1
-    ).mean()
-
-    return (loss_ade
-            + w_comfort * loss_comfort
-            + w_smooth * loss_smooth
-            + w_fde * loss_fde)
+loss_total = loss_jepa + lambda_traj * loss_traj
 ```
 
-The weights (w_comfort, w_smooth, etc.) become the "tuning knobs" — adjustable without retraining the model's core architecture. In later phases, these could even be conditioned on a desired driving style.
+`lambda_traj` is scheduled (constant/linear/cosine ramp) to avoid destabilizing early joint training while the trajectory head is still cold-starting.
 
 ---
 
@@ -407,7 +408,8 @@ The training loop is a modification of `app/vjepa/train.py`. The key changes are
 def train_step(
     encoder, target_encoder, predictor, trajectory_head,
     optimizer, scaler,
-    video_clips, masks_enc, masks_pred, gt_trajectories,
+    video_clips, masks_enc, masks_pred, gt_trajectories, ego_histories,
+    trajectory_dt, traj_loss_weights,
     lambda_traj=1.0, loss_exp=1.0,
 ):
     """Single training step for V-JEPA2-Drive."""
@@ -436,11 +438,17 @@ def train_step(
         # Full (unmasked) encoder features for trajectory prediction
         z_full = encoder(video_clips)  # [B, N, D]
 
-        # Predict waypoints
-        pred_waypoints = trajectory_head(z_full)  # [B, T, 2]
-
-        # Trajectory loss: minADE
-        loss_traj = min_ade_loss(pred_waypoints, gt_trajectories)
+        # Predict multimodal trajectory distribution
+        pred_dist = trajectory_head.predict_distribution(
+            z_full, ego_history=ego_histories
+        )
+        traj_stats = compute_multimodal_trajectory_losses(
+            pred_dist=pred_dist,
+            gt_trajectory=gt_trajectories,
+            dt=trajectory_dt,
+            weights=traj_loss_weights,
+        )
+        loss_traj = traj_stats["loss"]
 
         # ──── Combined Loss ────
         loss = loss_jepa + lambda_traj * loss_traj
@@ -504,13 +512,23 @@ model:
   use_rope: true
   # Trajectory head config
   trajectory_head:
+    num_modes: 4
     num_waypoints: 12
     waypoint_dim: 2
     pooler_depth: 2
 
 loss:
   loss_exp: 1.0
-  lambda_traj: 1.0     # Weight of trajectory loss relative to JEPA loss
+  lambda_traj_start: 0.25
+  lambda_traj_end: 1.0
+  lambda_traj_schedule: cosine
+  lambda_traj_ramp_epochs: 10
+  loss_ade_weight: 1.0
+  loss_fde_weight: 1.0
+  loss_nll_weight: 0.5
+  loss_calib_weight: 0.1
+  loss_smoothness_weight: 0.05
+  loss_feasibility_weight: 0.05
 
 mask:
   # Same masking config as V-JEPA2 pretraining
@@ -541,7 +559,7 @@ meta:
 
 ### 6.1 Phase 1: Initialize from Pretrained V-JEPA2
 
-Start from the pretrained V-JEPA2 ViT-L checkpoint (Meta release `vitl.pt`). This fits within A40 memory while retaining strong video priors. Scaling to ViT-g remains the plan for later phases once we have higher-memory GPUs.
+Start from the pretrained V-JEPA2 ViT-L checkpoint (Meta release `vitl.pt`) to retain strong video priors, then scale model/data once the joint objective is stable.
 - An encoder already trained on 22M internet videos with strong temporal understanding
 - A predictor already trained for masked latent prediction
 
@@ -557,16 +575,14 @@ param_groups = [
 ]
 ```
 
-### 6.2 Phase 2: Scale Up Data and Cost Functions
+### 6.2 Phase 2: Scale Up Data and Loss Tuning
 
 Once Phase 1 validates that joint training works (encoder learns trajectory-useful features):
 
 1. Scale to all available driving datasets (nuScenes + Argoverse + Waymo + NVIDIA AV + Lyft)
-2. Add cost function terms beyond minADE:
-   - FDE (Final Displacement Error)
-   - Comfort (jerk minimization)
-   - Smoothness (acceleration penalty)
-3. Experiment with `lambda_traj` to find the right balance
+2. Tune the composite trajectory objective weights (`ADE/FDE/NLL/calibration/smoothness/feasibility`)
+3. Experiment with `lambda_traj` scheduling to find the right JEPA/trajectory balance
+4. Validate runtime safety thresholds against uncertainty and dynamics signals
 
 ### 6.3 Phase 3: Multi-Camera + Extended Horizon
 
@@ -638,13 +654,13 @@ Starting with a single front camera (before multi-camera):
 - Tesla's early FSD versions also started single-camera
 - Validates the joint training concept before adding multi-camera complexity
 
-### 8.3 Why minADE as First Cost Function?
+### 8.3 Why Composite Trajectory Loss?
 
-- Simplest possible trajectory metric
-- Well-understood in the AD literature
-- Easy to compute differentiably
-- Provides clear signal that the model is learning useful representations
-- More complex costs (comfort, safety) can be added incrementally
+- Displacement terms (`minADE/minFDE`) keep geometric accuracy anchored.
+- NLL trains the model to represent uncertainty across modes.
+- Calibration ties predicted uncertainty to observed error.
+- Smoothness/feasibility reduce dynamically implausible trajectories.
+- Weighted terms provide explicit tradeoff controls without changing architecture.
 
 ### 8.4 Encoder Double Forward Pass vs. Shared Forward
 
@@ -655,7 +671,7 @@ Option B: Run encoder once unmasked, apply masking to features post-hoc — more
 # Option B (recommended):
 z_full = encoder(video_clip)           # One forward pass, no masking
 z_context = apply_masks(z_full, masks_enc)  # Post-hoc masking for JEPA
-pred_waypoints = trajectory_head(z_full)    # Full features for trajectory
+pred_dist = trajectory_head.predict_distribution(z_full, ego_history=ego_history)
 ```
 
 This is valid because V-JEPA2's masking is applied at the **token level** (selecting which patch tokens to keep), not at the input pixel level. The encoder can process all patches, and then we select the subset for the predictor.
@@ -668,8 +684,10 @@ This is valid because V-JEPA2's masking is applied at the **token level** (selec
 
 ### 9.1 Trajectory Metrics (Standard AD)
 
-- **minADE**: Average L2 displacement error across waypoints (primary metric)
-- **minFDE**: L2 error at final waypoint
+- **minADE / minFDE**: Best-mode geometric accuracy
+- **NLL**: Likelihood quality of multimodal distribution
+- **Calibration error**: Match between predicted variance and realized error
+- **Smoothness / feasibility penalties**: Dynamic plausibility
 - **Miss Rate**: Fraction of predictions > 2m from GT at final step
 - **Collision Rate**: (if obstacle info available)
 
@@ -703,7 +721,7 @@ This dual evaluation ensures the joint training improves trajectory prediction *
 
 ### Sprint 2 (Weeks 3-4): Joint Training
 5. Implement `TrajectoryHead` using `AttentivePooler`
-6. Implement `min_ade_loss`
+6. Implement composite multimodal trajectory losses (`ADE/FDE/NLL/calibration/smoothness/feasibility`)
 7. Implement `app/vjepa_drive/train.py` (modify existing train.py)
 8. Train on nuScenes with pretrained V-JEPA2 ViT-L (smaller, faster iteration)
 9. Validate: does trajectory loss decrease? Does JEPA loss remain stable?
@@ -711,7 +729,7 @@ This dual evaluation ensures the joint training improves trajectory prediction *
 ### Sprint 3 (Weeks 5-6): Scale Up
 10. Add Argoverse v2 and Waymo dataset loaders
 11. Scale to ViT-g encoder
-12. Add FDE and smoothness cost functions
+12. Tune loss weights and lambda schedules; evaluate uncertainty calibration
 13. Run ablation experiments
 
 ### Sprint 4 (Weeks 7-8): Multi-Camera + Analysis
@@ -728,7 +746,7 @@ This dual evaluation ensures the joint training improves trajectory prediction *
 |---|---|
 | Trajectory loss destabilizes JEPA training | Use lower LR for encoder; tune lambda_traj carefully; warmup trajectory head before joint training |
 | Encoder loses general video understanding | Monitor SSv2/K400 probing accuracy; use JEPA loss as regularizer |
-| minADE too simple as sole cost function | This is intentionally the starting point; richer costs added in Phase 2 |
+| Composite loss over-regularizes trajectory accuracy | Tune per-term weights; track ADE/FDE/NLL/calibration together instead of a single scalar |
 | Double encoder forward too expensive | Use shared forward pass (Option B in Section 8.4) |
 | Different datasets have different ego-motion formats | Abstract behind `ego_motion_utils.py` with per-dataset adapters |
 | Single camera insufficient for planning | Start here to validate approach; multi-camera in Sprint 4 |

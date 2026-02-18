@@ -59,6 +59,10 @@ class DataConfig:
     pin_mem: bool
     num_workers: int
     persistent_workers: bool
+    deterministic_loader: bool
+    prefetch_factor: int
+    decord_num_threads: int
+    ego_cache_size: int
     dataset_names: list[str] | None
     max_resample_attempts: int
     temporal_recipe: TemporalRecipe
@@ -169,6 +173,10 @@ def parse_train_sections(args: dict, resume_preempt: bool = False) -> TrainSecti
         pin_mem=bool(cfgs_data.get("pin_mem", False)),
         num_workers=int(cfgs_data.get("num_workers", 1)),
         persistent_workers=bool(cfgs_data.get("persistent_workers", True)),
+        deterministic_loader=bool(cfgs_data.get("deterministic_loader", True)),
+        prefetch_factor=max(1, int(cfgs_data.get("prefetch_factor", 2))),
+        decord_num_threads=max(1, int(cfgs_data.get("decord_num_threads", 2))),
+        ego_cache_size=max(0, int(cfgs_data.get("ego_cache_size", 512))),
         dataset_names=cfgs_data.get("dataset_names", None),
         max_resample_attempts=int(cfgs_data.get("max_resample_attempts", 64)),
         temporal_recipe=TemporalRecipe.from_data_cfg(cfgs_data),

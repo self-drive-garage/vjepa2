@@ -110,6 +110,10 @@ def main(args, resume_preempt=False):
     pin_mem = sections.data.pin_mem
     num_workers = sections.data.num_workers
     persistent_workers = sections.data.persistent_workers
+    deterministic_loader = sections.data.deterministic_loader
+    prefetch_factor = sections.data.prefetch_factor
+    decord_num_threads = sections.data.decord_num_threads
+    ego_cache_size = sections.data.ego_cache_size
     trajectory_horizon = sections.data.temporal_recipe.future_horizon
     trajectory_dt = sections.data.temporal_recipe.future_dt
     trajectory_history_horizon = sections.data.temporal_recipe.history_horizon
@@ -279,6 +283,7 @@ def main(args, resume_preempt=False):
         world_size=world_size,
         datasets_weights=datasets_weights,
         persistent_workers=persistent_workers,
+        deterministic=deterministic_loader,
         collator=mask_collator,
         num_workers=num_workers,
         pin_mem=pin_mem,
@@ -290,6 +295,9 @@ def main(args, resume_preempt=False):
         trajectory_history_dt=trajectory_history_dt,
         dataset_names=dataset_names,
         max_resample_attempts=max_resample_attempts,
+        prefetch_factor=prefetch_factor,
+        decord_num_threads=decord_num_threads,
+        ego_cache_size=ego_cache_size,
     )
     try:
         _dlen = len(unsupervised_loader)
@@ -315,6 +323,7 @@ def main(args, resume_preempt=False):
         num_epochs=num_epochs,
         ipe_scale=ipe_scale,
         mixed_precision=mixed_precision,
+        amp_dtype=dtype,
         betas=betas,
         eps=eps,
         encoder_lr_scale=encoder_lr_scale,
@@ -324,14 +333,18 @@ def main(args, resume_preempt=False):
             "Wrapping models with DDP (predictor_find_unused_parameters=%s)",
             predictor_find_unused_parameters,
         )
-        encoder = DistributedDataParallel(encoder, static_graph=True)
+        ddp_kwargs = {
+            "broadcast_buffers": False,
+            "gradient_as_bucket_view": True,
+        }
+        encoder = DistributedDataParallel(encoder, static_graph=True, **ddp_kwargs)
         predictor = DistributedDataParallel(
             predictor,
-            static_graph=False,
+            static_graph=not predictor_find_unused_parameters,
             find_unused_parameters=predictor_find_unused_parameters,
+            **ddp_kwargs,
         )
-        trajectory_head = DistributedDataParallel(trajectory_head, static_graph=True)
-        target_encoder = DistributedDataParallel(target_encoder)
+        trajectory_head = DistributedDataParallel(trajectory_head, static_graph=True, **ddp_kwargs)
     else:
         logger.info("Distributed process group not initialized; running in single-process mode.")
     for p in target_encoder.parameters():

@@ -89,6 +89,7 @@ def init_drive_opt(
     final_wd=1e-6,
     final_lr=0.0,
     mixed_precision=False,
+    amp_dtype=None,
     ipe_scale=1.25,
     betas=(0.9, 0.999),
     eps=1e-8,
@@ -137,7 +138,16 @@ def init_drive_opt(
         },
     ]
 
-    optimizer = torch.optim.AdamW(param_groups, betas=betas, eps=eps)
+    adamw_kwargs = {"betas": betas, "eps": eps}
+    if torch.cuda.is_available():
+        try:
+            optimizer = torch.optim.AdamW(param_groups, fused=True, **adamw_kwargs)
+            logger.info("Using fused AdamW.")
+        except TypeError:
+            optimizer = torch.optim.AdamW(param_groups, **adamw_kwargs)
+            logger.info("Fused AdamW unavailable; using standard AdamW.")
+    else:
+        optimizer = torch.optim.AdamW(param_groups, **adamw_kwargs)
     if not is_anneal:
         scheduler = WarmupCosineSchedule(
             optimizer,
@@ -160,7 +170,8 @@ def init_drive_opt(
         final_wd=final_wd,
         T_max=int(ipe_scale * num_epochs * iterations_per_epoch),
     )
-    scaler = torch.cuda.amp.GradScaler() if mixed_precision else None
+    use_grad_scaler = mixed_precision and amp_dtype == torch.float16 and torch.cuda.is_available()
+    scaler = torch.cuda.amp.GradScaler() if use_grad_scaler else None
     return optimizer, scaler, scheduler, wd_scheduler
 
 

@@ -18,6 +18,7 @@ Requires:
     - physical_ai_av devkit installed (pip install -e physical_ai_av/)
     - HuggingFace token at /localhome/local-samehm/.hugging_face_token
     - Optional override: VJEPA_HF_CACHE_DIR=/path/to/cache
+    - Optional chunk cache eviction toggle: VJEPA_EVICT_USED_CHUNK_CACHE=0|1
 """
 
 import argparse
@@ -28,10 +29,11 @@ import pathlib
 import sys
 import zipfile
 
+import huggingface_hub
 import numpy as np
 import pandas as pd
 import yaml
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from typing import Iterable
 
 from app.vjepa_drive.temporal_recipe import TemporalRecipe
@@ -59,6 +61,11 @@ CLIP_STRIDE_SEC = float(os.environ.get("VJEPA_CLIP_STRIDE_SEC", "1.0"))
 MAX_WINDOWS_PER_CLIP = int(os.environ.get("VJEPA_MAX_WINDOWS_PER_CLIP", "0"))
 WRITE_EVERY_CLIPS = int(os.environ.get("VJEPA_WRITE_EVERY_CLIPS", "50"))
 TRAIN_CONFIG_PATH = os.environ.get("VJEPA_TRAIN_CONFIG", "").strip()
+EVICT_USED_CHUNK_CACHE = os.environ.get("VJEPA_EVICT_USED_CHUNK_CACHE", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -286,6 +293,114 @@ def feature_zip_cached(ds, clip_id: str, feature: str) -> bool:
     return ds.is_file_cached(chunk_filename)
 
 
+def build_clip_chunk_file_refcounts(
+    ds,
+    clip_ids: list[str],
+    features: list[str],
+) -> tuple[dict[str, tuple[str, ...]], Counter]:
+    """Precompute per-clip chunk files and remaining cross-clip references."""
+    per_clip_files: dict[str, tuple[str, ...]] = {}
+    file_refcounts: Counter = Counter()
+    for clip_id in clip_ids:
+        chunk_id = ds.get_clip_chunk(clip_id)
+        files = []
+        for feature in features:
+            if (
+                feature in ds.chunk_sensor_presence.columns
+                and not bool(ds.chunk_sensor_presence.at[chunk_id, feature])
+            ):
+                continue
+            filename = ds.features.get_chunk_feature_filename(chunk_id, feature)
+            files.append(filename)
+            file_refcounts[filename] += 1
+        per_clip_files[clip_id] = tuple(files)
+    return per_clip_files, file_refcounts
+
+
+def _resolve_cached_hf_path(ds, filename: str) -> pathlib.Path | None:
+    cached = huggingface_hub.try_to_load_from_cache(
+        filename=filename,
+        cache_dir=ds.cache_dir,
+        **ds.repo_snapshot_info,
+    )
+    return pathlib.Path(cached) if isinstance(cached, str) else None
+
+
+def _prune_empty_parents(path: pathlib.Path, stop_at: pathlib.Path) -> None:
+    current = path
+    while True:
+        if current == stop_at:
+            return
+        try:
+            current.rmdir()
+        except FileNotFoundError:
+            return
+        except OSError:
+            return
+        current = current.parent
+
+
+def evict_cached_chunk_file(ds, filename: str) -> tuple[bool, int]:
+    """Evict a cached chunk file pointer and its blob from local HF cache."""
+    cached_path = _resolve_cached_hf_path(ds, filename)
+    if cached_path is None:
+        return False, 0
+
+    blob_path = None
+    if cached_path.is_symlink():
+        try:
+            blob_path = cached_path.resolve(strict=True)
+        except FileNotFoundError:
+            blob_path = None
+    elif cached_path.exists():
+        blob_path = cached_path
+
+    try:
+        cached_path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("  Failed to evict HF cache pointer for %s: %s", filename, exc)
+        return False, 0
+
+    bytes_freed = 0
+    if blob_path is not None and blob_path.exists():
+        try:
+            blob_path.resolve().relative_to(HF_CACHE_DIR.resolve())
+            bytes_freed = int(blob_path.stat().st_size)
+            blob_path.unlink()
+        except ValueError:
+            logger.warning("  Refusing to remove blob outside HF cache dir: %s", blob_path)
+        except OSError as exc:
+            logger.warning("  Failed to evict HF blob for %s: %s", filename, exc)
+
+    _prune_empty_parents(cached_path.parent, HF_CACHE_DIR.resolve())
+    return True, bytes_freed
+
+
+def release_finished_clip_chunk_files(
+    ds,
+    clip_id: str,
+    per_clip_files: dict[str, tuple[str, ...]],
+    file_refcounts: Counter,
+) -> tuple[int, int]:
+    """Decrement remaining chunk references and evict files once exhausted."""
+    evicted_files = 0
+    evicted_bytes = 0
+    for filename in per_clip_files.get(clip_id, ()):
+        remaining = int(file_refcounts.get(filename, 0))
+        if remaining <= 0:
+            continue
+        remaining -= 1
+        if remaining <= 0:
+            file_refcounts.pop(filename, None)
+            evicted, bytes_freed = evict_cached_chunk_file(ds, filename)
+            if evicted:
+                evicted_files += 1
+                evicted_bytes += bytes_freed
+        else:
+            file_refcounts[filename] = remaining
+    return evicted_files, evicted_bytes
+
+
 def extract_egomotion_csv(
     ego_interpolator,
     frame_timestamps: np.ndarray,
@@ -461,6 +576,24 @@ def main(args: argparse.Namespace):
     logger.debug(f"  Selected clip ids: {selected_clip_ids}")
 
     # ------------------------------------------------------------------
+    # Step 3.5: Build cache-eviction index
+    # ------------------------------------------------------------------
+    per_clip_chunk_files: dict[str, tuple[str, ...]] = {}
+    chunk_file_refcounts: Counter = Counter()
+    if ds is not None and EVICT_USED_CHUNK_CACHE:
+        per_clip_chunk_files, chunk_file_refcounts = build_clip_chunk_file_refcounts(
+            ds=ds,
+            clip_ids=selected_clip_ids,
+            features=FEATURES_TO_DOWNLOAD,
+        )
+        logger.info(
+            "Step 3.5: Chunk-aware cache eviction enabled (%d unique chunk files tracked).",
+            len(chunk_file_refcounts),
+        )
+    elif ds is not None:
+        logger.info("Step 3.5: Chunk-aware cache eviction disabled.")
+
+    # ------------------------------------------------------------------
     # Step 4: Create output directories
     # ------------------------------------------------------------------
     logger.info("Step 4: Creating output directories...")
@@ -483,6 +616,8 @@ def main(args: argparse.Namespace):
     successful_clips = 0
     generated_samples = 0
     reused_local_assets = 0
+    evicted_chunk_files = 0
+    evicted_chunk_bytes = 0
 
     for i, clip_id in enumerate(selected_clip_ids):
         if len(train_row_map) >= MAX_SAMPLES_CAP:
@@ -627,6 +762,22 @@ def main(args: argparse.Namespace):
             logger.error(f"  FAILED to process clip {clip_id}: {e}", exc_info=True)
             logger.info("  Skipping this clip and continuing...")
             continue
+        finally:
+            if ds is not None and EVICT_USED_CHUNK_CACHE:
+                clip_evicted_files, clip_evicted_bytes = release_finished_clip_chunk_files(
+                    ds=ds,
+                    clip_id=clip_id,
+                    per_clip_files=per_clip_chunk_files,
+                    file_refcounts=chunk_file_refcounts,
+                )
+                evicted_chunk_files += clip_evicted_files
+                evicted_chunk_bytes += clip_evicted_bytes
+                if clip_evicted_files > 0:
+                    logger.info(
+                        "  Evicted %d exhausted chunk file(s) from HF cache (%.2f GB).",
+                        clip_evicted_files,
+                        clip_evicted_bytes / (1024**3),
+                    )
 
     # ------------------------------------------------------------------
     # Step 6: Create training CSV
@@ -653,6 +804,9 @@ def main(args: argparse.Namespace):
     logger.info(f"  Clips reused local assets:   {reused_local_assets}")
     logger.info(f"  Samples generated (this run): {generated_samples}")
     logger.info(f"  Sample cap:                 {MAX_SAMPLES_CAP}")
+    if ds is not None and EVICT_USED_CHUNK_CACHE:
+        logger.info(f"  Chunk files evicted:        {evicted_chunk_files}")
+        logger.info(f"  Chunk bytes evicted:        {evicted_chunk_bytes / (1024**3):.2f} GB")
     logger.info(
         "  Clips failed (this run):     %d",
         len(selected_clip_ids) - successful_clips,

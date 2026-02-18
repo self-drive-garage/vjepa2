@@ -121,6 +121,9 @@ def init_data(
             trajectory_history_dt=kwargs.get("trajectory_history_dt", 0.5),
             dataset_names=kwargs.get("dataset_names", None),
             max_resample_attempts=kwargs.get("max_resample_attempts", 64),
+            prefetch_factor=kwargs.get("prefetch_factor", 2),
+            decord_num_threads=kwargs.get("decord_num_threads", 2),
+            ego_cache_size=kwargs.get("ego_cache_size", 512),
         )
 
     return (data_loader, dist_sampler)
