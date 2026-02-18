@@ -17,7 +17,7 @@ data:
   num_workers: 12
   pin_mem: true
   persistent_workers: true
-  deterministic_loader: false
+  deterministic_loader: true
   prefetch_factor: 4
   decord_num_threads: 2
   ego_cache_size: 2048

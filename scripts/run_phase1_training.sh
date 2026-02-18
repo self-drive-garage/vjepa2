@@ -34,6 +34,14 @@ USAGE
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+VENV_ACTIVATE="${PROJECT_ROOT}/.venv/bin/activate"
+
+if [[ -f "$VENV_ACTIVATE" ]]; then
+    # shellcheck disable=SC1090
+    source "$VENV_ACTIVATE"
+else
+    echo "WARNING: venv activate script not found at $VENV_ACTIVATE; using current Python environment."
+fi
 
 CONFIG_TEMPLATE="${PROJECT_ROOT}/configs/train/vitg16/driving-joint-256px-16f-8xa100.yaml"
 OUTPUT_ROOT="${PROJECT_ROOT}/logs/vjepa_drive"
@@ -297,4 +305,18 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 export NCCL_ASYNC_ERROR_HANDLING="${NCCL_ASYNC_ERROR_HANDLING:-1}"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
-PYTHONPATH="$PROJECT_ROOT:${PYTHONPATH:-}" python3 -m app.main --fname "$RUN_CONFIG_PATH" --devices "${DEVICE_ARGS[@]}" 2>&1 | tee "$CONSOLE_LOG"
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-${HOME}/.cache/torchinductor}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${HOME}/.cache/triton}"
+mkdir -p "${TORCHINDUCTOR_CACHE_DIR}" "${TRITON_CACHE_DIR}"
+export PYTHONPATH="$PROJECT_ROOT:${PYTHONPATH:-}"
+
+PID_FILE="${RUN_FOLDER}/train.pid"
+nohup python3 -m app.main --fname "$RUN_CONFIG_PATH" --devices "${DEVICE_ARGS[@]}" > "$CONSOLE_LOG" 2>&1 &
+TRAIN_PID=$!
+echo "$TRAIN_PID" > "$PID_FILE"
+
+echo "  PID file        : $PID_FILE"
+echo "  Train PID       : $TRAIN_PID"
+echo "Tailing console log (Ctrl-C stops tail only; training keeps running)..."
+sleep 1
+tail -n 200 -f "$CONSOLE_LOG"
