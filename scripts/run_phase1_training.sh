@@ -34,7 +34,7 @@ USAGE
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-VENV_ACTIVATE="${PROJECT_ROOT}/.venv/bin/activate"
+VENV_ACTIVATE="${PROJECT_ROOT}/../.venv/bin/activate"
 
 if [[ -f "$VENV_ACTIVATE" ]]; then
     # shellcheck disable=SC1090
