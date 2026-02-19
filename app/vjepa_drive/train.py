@@ -7,7 +7,8 @@ import os
 
 # -- FOR DISTRIBUTED TRAINING ENSURE ONLY 1 DEVICE VISIBLE PER PROCESS
 try:
-    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["SLURM_LOCALID"]
+    if ("CUDA_VISIBLE_DEVICES" not in os.environ) and ("LOCAL_RANK" not in os.environ):
+        os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["SLURM_LOCALID"]
 except Exception:
     pass
 
@@ -45,6 +46,22 @@ torch.backends.cudnn.allow_tf32 = True
 
 
 logger = get_logger(__name__, force=True)
+
+
+def _resolve_local_cuda_index() -> int:
+    local_rank = os.environ.get("LOCAL_RANK", None)
+    if local_rank is None:
+        return 0
+    try:
+        local_rank = int(local_rank)
+    except Exception:
+        return 0
+
+    # If the process has already been pinned to one GPU, always use cuda:0.
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if visible and ("," not in visible):
+        return 0
+    return max(local_rank, 0)
 
 
 def main(args, resume_preempt=False):
@@ -169,7 +186,8 @@ def main(args, resume_preempt=False):
     if not torch.cuda.is_available():
         device = torch.device("cpu")
     else:
-        device = torch.device("cuda:0")
+        local_cuda_index = _resolve_local_cuda_index()
+        device = torch.device(f"cuda:{local_cuda_index}")
         torch.cuda.set_device(device)
 
     if device.type == "cpu" and mixed_precision:

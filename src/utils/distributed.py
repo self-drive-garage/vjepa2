@@ -14,6 +14,16 @@ from src.utils.logging import get_logger
 logger = get_logger()
 
 
+def _read_int_env(name):
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
 def init_distributed(port=37129, rank_and_world_size=(None, None)):
     # try to set all environment variables to avoid triggering a segfault
     # environment variables can be reallocated during the execution of torch.distributed.init_process_group
@@ -29,21 +39,32 @@ def init_distributed(port=37129, rank_and_world_size=(None, None)):
         return dist.get_world_size(), dist.get_rank()
 
     rank, world_size = rank_and_world_size
-    os.environ["MASTER_ADDR"] = "localhost"
-
     if (rank is None) or (world_size is None):
-        try:
-            world_size = int(os.environ["SLURM_NTASKS"])
-            rank = int(os.environ["SLURM_PROCID"])
+        # torchrun-style environment variables (multi-node and single-node).
+        torchrun_world_size = _read_int_env("WORLD_SIZE")
+        torchrun_rank = _read_int_env("RANK")
+        if (torchrun_world_size is not None) and (torchrun_rank is not None):
+            world_size = torchrun_world_size
+            rank = torchrun_rank
+        else:
+            try:
+                world_size = int(os.environ["SLURM_NTASKS"])
+                rank = int(os.environ["SLURM_PROCID"])
+            except Exception:
+                logger.info("Distributed env vars not set (distributed training not available)")
+                world_size, rank = 1, 0
+                return world_size, rank
+
+    if "MASTER_ADDR" not in os.environ:
+        if "HOSTNAME" in os.environ:
             os.environ["MASTER_ADDR"] = os.environ["HOSTNAME"]
-        except Exception:
-            logger.info("SLURM vars not set (distributed training not available)")
-            world_size, rank = 1, 0
-            return world_size, rank
+        else:
+            os.environ["MASTER_ADDR"] = "localhost"
 
     backend = os.environ.get("TORCH_DISTRIBUTED_BACKEND", "nccl").lower()
     try:
-        os.environ["MASTER_PORT"] = str(port)
+        if "MASTER_PORT" not in os.environ:
+            os.environ["MASTER_PORT"] = str(port)
         torch.distributed.init_process_group(backend=backend, world_size=world_size, rank=rank)
     except Exception as e:
         world_size, rank = 1, 0
