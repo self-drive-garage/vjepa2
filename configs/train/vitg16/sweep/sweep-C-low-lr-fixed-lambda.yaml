@@ -1,0 +1,120 @@
+## Sweep C: Short warmup (5ep), low LR, FIXED lambda (no ramp), strongest regularization
+## Hypothesis: Eliminate the lambda ramp entirely. Use a fixed lambda_traj=2.0 from the start.
+##   Lower LR (1.5e-4) for more stable optimization. Strongest smooth/feasibility weights.
+##   If the plateau in run 1 was caused by schedule interference, a static schedule should
+##   show clean monotonic improvement until true convergence.
+app: vjepa_drive
+
+folder: logs/vjepa_drive/sweep-C/
+
+data:
+  dataset_type: drivingvideodataset
+  datasets:
+    - data/nvidia_av/train.csv
+  datasets_weights: [1]
+  dataset_names: [nvidia_av]
+  batch_size: 6
+  crop_size: 256
+  dataset_fpcs: [16]
+  fps: 4
+  patch_size: 16
+  tubelet_size: 2
+  num_workers: 12
+  pin_mem: true
+  persistent_workers: true
+  deterministic_loader: true
+  prefetch_factor: 4
+  decord_num_threads: 2
+  ego_cache_size: 2048
+  max_resample_attempts: 64
+  trajectory_horizon: 12
+  trajectory_dt: 0.5
+  trajectory_history_horizon: 8
+  trajectory_history_dt: 0.5
+
+data_aug:
+  random_resize_aspect_ratio: [0.75, 1.3333]
+  random_resize_scale: [0.3, 1.0]
+  motion_shift: false
+  reprob: 0.0
+  auto_augment: false
+
+model:
+  model_name: vit_large
+  pred_depth: 12
+  pred_embed_dim: 384
+  pred_num_heads: 12
+  use_mask_tokens: true
+  use_rope: true
+  use_silu: false
+  wide_silu: false
+  compile_model: true
+  use_activation_checkpointing: true
+  predictor_find_unused_parameters: false
+  trajectory_head:
+    num_waypoints: 12
+    waypoint_dim: 2
+    num_modes: 4
+    history_dim: 2
+    history_tokens: 8
+    history_hidden_dim: 512
+    min_log_std: -4.0
+    max_log_std: 0.6
+    pooler_depth: 2
+    num_heads: 16
+    mlp_ratio: 4.0
+
+mask:
+  - spatial_scale: [0.15, 0.15]
+    temporal_scale: [1.0, 1.0]
+    aspect_ratio: [0.75, 1.5]
+    num_blocks: 8
+  - spatial_scale: [0.7, 0.7]
+    temporal_scale: [1.0, 1.0]
+    aspect_ratio: [0.75, 1.5]
+    num_blocks: 2
+
+loss:
+  loss_exp: 1.0
+  lambda_traj_start: 2.0
+  lambda_traj_end: 2.0
+  lambda_traj_schedule: cosine
+  lambda_traj_ramp_epochs: 1
+  loss_ade_weight: 1.0
+  loss_fde_weight: 1.0
+  loss_nll_weight: 0.5
+  loss_calib_weight: 0.15
+  loss_smoothness_weight: 0.2
+  loss_feasibility_weight: 0.2
+  feasibility_speed_limit_mps: 25.0
+  feasibility_accel_limit_mps2: 6.0
+
+runtime_safety:
+  min_confidence: 0.45
+  max_avg_std: 1.9
+  max_mode_entropy: 1.2
+  speed_limit_mps: 25.0
+  accel_limit_mps2: 6.0
+  fallback_mode: constant_velocity
+
+optimization:
+  lr: 0.00015
+  start_lr: 0.00005
+  final_lr: 0.000001
+  weight_decay: 0.04
+  final_weight_decay: 0.04
+  warmup: 5
+  epochs: 30
+  ema: [0.99925, 0.99925]
+  ipe_scale: 1.0
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  encoder_lr_scale: 0.1
+
+meta:
+  dtype: bfloat16
+  use_sdpa: true
+  load_checkpoint: true
+  read_checkpoint: checkpoints/vitl.pt
+  seed: 0
+  save_every_freq: 5
