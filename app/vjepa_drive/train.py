@@ -168,6 +168,7 @@ def main(args, resume_preempt=False):
     betas = sections.optimization.betas
     eps = sections.optimization.eps
     encoder_lr_scale = sections.optimization.encoder_lr_scale
+    gradient_accumulation_steps = sections.optimization.gradient_accumulation_steps
     # ----------------------------------------------------------------------- #
 
     np.random.seed(seed)
@@ -325,6 +326,15 @@ def main(args, resume_preempt=False):
         ipe = _dlen
     logger.info(f"iterations per epoch/dataset length: {ipe}/{_dlen}")
 
+    # With gradient accumulation, each optimizer step consumes
+    # gradient_accumulation_steps micro-batches.  Schedulers and the momentum
+    # ramp are defined in terms of optimizer steps, so we use effective_ipe.
+    effective_ipe = ipe // gradient_accumulation_steps
+    logger.info(
+        f"gradient_accumulation_steps={gradient_accumulation_steps}, "
+        f"effective_ipe (optimizer steps per epoch)={effective_ipe}"
+    )
+
     # -- init optimizer and scheduler (with differential LR)
     optimizer, scaler, scheduler, wd_scheduler = init_drive_opt(
         is_anneal=is_anneal,
@@ -336,7 +346,7 @@ def main(args, resume_preempt=False):
         start_lr=start_lr,
         ref_lr=lr,
         final_lr=final_lr,
-        iterations_per_epoch=ipe,
+        iterations_per_epoch=effective_ipe,
         warmup=warmup,
         num_epochs=num_epochs,
         ipe_scale=ipe_scale,
@@ -372,10 +382,10 @@ def main(args, resume_preempt=False):
         model = trajectory_head.module if isinstance(trajectory_head, DistributedDataParallel) else trajectory_head
         return model.predict_distribution(features, ego_history=ego_history)
 
-    # -- momentum schedule
+    # -- momentum schedule (defined over optimizer steps, not micro-batches)
     momentum_scheduler = (
-        ema[0] + i * (ema[1] - ema[0]) / (ipe * num_epochs * ipe_scale)
-        for i in range(int(ipe * num_epochs * ipe_scale) + 1)
+        ema[0] + i * (ema[1] - ema[0]) / (effective_ipe * num_epochs * ipe_scale)
+        for i in range(int(effective_ipe * num_epochs * ipe_scale) + 1)
     )
 
     start_epoch = 0
@@ -400,7 +410,7 @@ def main(args, resume_preempt=False):
             is_anneal=is_anneal and not resume_anneal,
         )
         if not is_anneal or resume_anneal:
-            for _ in range(start_epoch * ipe):
+            for _ in range(start_epoch * effective_ipe):
                 scheduler.step()
                 wd_scheduler.step()
                 next(momentum_scheduler)
@@ -453,7 +463,7 @@ def main(args, resume_preempt=False):
         logger.info("Epoch %d" % (epoch + 1))
         loader, epoch_meters = run_training_epoch(
             epoch=epoch,
-            ipe=ipe,
+            ipe=effective_ipe,
             batch_size=batch_size,
             dataset_fpcs=dataset_fpcs,
             loader=loader,
@@ -463,6 +473,7 @@ def main(args, resume_preempt=False):
             encoder=encoder,
             predictor=predictor,
             target_encoder=target_encoder,
+            trajectory_head=trajectory_head,
             predict_traj_distribution=predict_traj_distribution,
             optimizer=optimizer,
             scaler=scaler,
@@ -482,6 +493,7 @@ def main(args, resume_preempt=False):
             csv_logger=csv_logger,
             logger=logger,
             log_freq=log_freq,
+            gradient_accumulation_steps=gradient_accumulation_steps,
         )
         log_epoch_summary(logger, epoch_meters)
         if epoch % CHECKPOINT_FREQ == 0 or epoch == (num_epochs - 1):

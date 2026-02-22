@@ -11,6 +11,7 @@ import time
 
 import numpy as np
 import torch
+from torch.nn.parallel import DistributedDataParallel
 
 from app.vjepa_drive.losses import TrajectoryLossWeights, schedule_scalar
 from app.vjepa_drive.train_logging import (
@@ -39,6 +40,16 @@ def _autocast_context(device: torch.device, dtype: torch.dtype, enabled: bool):
     return contextlib.nullcontext()
 
 
+@contextlib.contextmanager
+def _no_sync(*modules):
+    """Disable DDP gradient sync on the given modules."""
+    with contextlib.ExitStack() as stack:
+        for m in modules:
+            if isinstance(m, DistributedDataParallel):
+                stack.enter_context(m.no_sync())
+        yield
+
+
 def _update_target_encoder(encoder, target_encoder, momentum_value: float) -> None:
     with torch.no_grad():
         params_k = []
@@ -63,6 +74,7 @@ def run_training_epoch(
     encoder,
     predictor,
     target_encoder,
+    trajectory_head,
     predict_traj_distribution,
     optimizer,
     scaler,
@@ -82,18 +94,17 @@ def run_training_epoch(
     csv_logger,
     logger,
     log_freq: int,
+    gradient_accumulation_steps: int = 1,
 ) -> tuple[object, EpochMeters]:
     meters = make_epoch_meters(dataset_fpcs)
 
-    for itr in range(ipe):
-        itr_start_time = time.time()
-
+    def _load_micro_batch():
+        """Load one micro-batch with retry logic, returning the raw sample."""
+        nonlocal loader
         iter_retries = 0
-        iter_successful = False
-        while not iter_successful:
+        while True:
             try:
-                sample = next(loader)
-                iter_successful = True
+                return next(loader)
             except StopIteration:
                 logger.info("Exhausted data loaders. Refreshing...")
                 unsupervised_sampler.set_epoch(epoch)
@@ -108,10 +119,8 @@ def run_training_epoch(
                     logger.warning(f"Exceeded max retries ({num_retries}) when loading data. Skipping batch.")
                     raise e
 
-        for fpc_sample in sample:
-            bs, fpc = fpc_sample.batch_size_and_fpc()
-            meters.mask[fpc].update(bs / batch_size)
-
+    def _prepare_batch(sample):
+        """Move sample to device and unpack into tensors."""
         clips, masks_enc, masks_pred, gt_trajectories, ego_histories = [], [], [], [], []
         for fpc_sample in sample:
             fpc_batch = fpc_sample.to_device(device)
@@ -120,6 +129,19 @@ def run_training_epoch(
             masks_pred.append(fpc_batch.masks_pred)
             gt_trajectories.append(fpc_batch.gt_trajectories)
             ego_histories.append(fpc_batch.ego_histories)
+        return clips, masks_enc, masks_pred, gt_trajectories, ego_histories
+
+    for itr in range(ipe):
+        itr_start_time = time.time()
+
+        # Load all micro-batches for this optimizer step
+        micro_batches = []
+        for _ in range(gradient_accumulation_steps):
+            sample = _load_micro_batch()
+            for fpc_sample in sample:
+                bs, fpc = fpc_sample.batch_size_and_fpc()
+                meters.mask[fpc].update(bs / batch_size)
+            micro_batches.append(_prepare_batch(sample))
 
         data_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
         if sync_gc and (itr + 1) % GARBAGE_COLLECT_ITR_FREQ == 0:
@@ -138,49 +160,72 @@ def run_training_epoch(
                 schedule=lambda_traj_schedule,
             )
 
-            with _autocast_context(device=device, dtype=dtype, enabled=mixed_precision):
-                h = forward_target_encoder(target_encoder, clips)
-                z_full = forward_encoder_full(encoder, clips)
-                z_pred = forward_predictor_from_full(predictor, z_full, masks_enc, masks_pred)
-                loss_jepa = compute_jepa_loss(z_pred, h, masks_pred, loss_exp)
-                traj_stats = compute_trajectory_stats(
-                    z_full=z_full,
-                    gt_trajectories=gt_trajectories,
-                    ego_histories=ego_histories,
-                    predict_fn=predict_traj_distribution,
-                    trajectory_dt=trajectory_dt,
-                    weights=traj_loss_weights,
-                )
-                loss_traj = traj_stats["loss"]
-                loss = loss_jepa + lambda_traj * loss_traj
+            accum_loss = 0.0
+            accum_loss_jepa = 0.0
+            accum_loss_traj = 0.0
+            accum_traj_stats: dict[str, float] = {}
 
+            for micro_idx, (clips, masks_enc, masks_pred, gt_trajectories, ego_histories) in enumerate(micro_batches):
+                is_last = micro_idx == gradient_accumulation_steps - 1
+                sync_ctx = contextlib.nullcontext() if is_last else _no_sync(encoder, predictor, trajectory_head)
+
+                with sync_ctx:
+                    with _autocast_context(device=device, dtype=dtype, enabled=mixed_precision):
+                        h = forward_target_encoder(target_encoder, clips)
+                        z_full = forward_encoder_full(encoder, clips)
+                        z_pred = forward_predictor_from_full(predictor, z_full, masks_enc, masks_pred)
+                        loss_jepa = compute_jepa_loss(z_pred, h, masks_pred, loss_exp)
+                        traj_stats = compute_trajectory_stats(
+                            z_full=z_full,
+                            gt_trajectories=gt_trajectories,
+                            ego_histories=ego_histories,
+                            predict_fn=predict_traj_distribution,
+                            trajectory_dt=trajectory_dt,
+                            weights=traj_loss_weights,
+                        )
+                        loss_traj = traj_stats["loss"]
+                        loss = (loss_jepa + lambda_traj * loss_traj) / gradient_accumulation_steps
+
+                    if mixed_precision and scaler is not None:
+                        scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
+
+                # Accumulate unscaled metrics for logging
+                accum_loss += float(loss_jepa) + lambda_traj * float(loss_traj)
+                accum_loss_jepa += float(loss_jepa)
+                accum_loss_traj += float(loss_traj)
+                for k in ("min_ade", "min_fde", "nll", "calib", "smoothness", "feasibility", "top_prob", "mode_entropy", "avg_std"):
+                    accum_traj_stats[k] = accum_traj_stats.get(k, 0.0) + float(traj_stats[k])
+
+            # Optimizer step (once after all micro-batches)
             if mixed_precision and scaler is not None:
-                scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                loss.backward()
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
             momentum_value = next(momentum_scheduler)
             _update_target_encoder(encoder, target_encoder, momentum_value)
 
+            # Average metrics across micro-batches
+            n = gradient_accumulation_steps
             return {
-                "loss": float(loss),
-                "loss_jepa": float(loss_jepa),
-                "loss_traj": float(loss_traj),
+                "loss": accum_loss / n,
+                "loss_jepa": accum_loss_jepa / n,
+                "loss_traj": accum_loss_traj / n,
                 "lambda_traj": float(lambda_traj),
-                "traj_ade": float(traj_stats["min_ade"]),
-                "traj_fde": float(traj_stats["min_fde"]),
-                "traj_nll": float(traj_stats["nll"]),
-                "traj_calib": float(traj_stats["calib"]),
-                "traj_smooth": float(traj_stats["smoothness"]),
-                "traj_feasible": float(traj_stats["feasibility"]),
-                "traj_top_prob": float(traj_stats["top_prob"]),
-                "traj_entropy": float(traj_stats["mode_entropy"]),
-                "traj_avg_std": float(traj_stats["avg_std"]),
+                "traj_ade": accum_traj_stats["min_ade"] / n,
+                "traj_fde": accum_traj_stats["min_fde"] / n,
+                "traj_nll": accum_traj_stats["nll"] / n,
+                "traj_calib": accum_traj_stats["calib"] / n,
+                "traj_smooth": accum_traj_stats["smoothness"] / n,
+                "traj_feasible": accum_traj_stats["feasibility"] / n,
+                "traj_top_prob": accum_traj_stats["top_prob"] / n,
+                "traj_entropy": accum_traj_stats["mode_entropy"] / n,
+                "traj_avg_std": accum_traj_stats["avg_std"] / n,
                 "wd": float(new_wd),
                 "lr": float(new_lr),
             }

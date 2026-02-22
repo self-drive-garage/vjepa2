@@ -6,13 +6,13 @@
 import argparse
 import multiprocessing as mp
 import pprint
+import socket
 import sys
 from pathlib import Path
 
 import yaml
 
 from app.scaffold import main as app_main
-from src.utils.distributed import init_distributed
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--fname", type=str, help="name of config file to load", default="configs.yaml")
@@ -33,10 +33,25 @@ parser.add_argument(
 )
 
 
-def process_main(rank, fname, world_size, devices):
+def _find_free_port():
+    """Find a free TCP port by binding to port 0 and reading the OS-assigned port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+def process_main(rank, fname, world_size, devices, port):
     import os
 
     os.environ["CUDA_VISIBLE_DEVICES"] = str(devices[rank].split(":")[-1])
+
+    # Set distributed env vars so train.py's init_distributed() picks them up.
+    # This is the ONLY place rank/world_size/port are injected — train.py reads them.
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(port)
 
     import logging
 
@@ -66,24 +81,23 @@ def process_main(rank, fname, world_size, devices):
         with open(params_path, "w") as f:
             yaml.dump(params, f)
 
-    # Init distributed (access to comm between GPUS on same machine)
-    world_size, rank = init_distributed(rank_and_world_size=(rank, world_size))
     logger.info(f"Running... (rank: {rank}/{world_size})")
 
-    # Launch the app with loaded config
+    # Launch the app with loaded config — init_distributed is called inside train.main()
     app_main(params["app"], args=params)
 
 
 if __name__ == "__main__":
     args = parser.parse_args()
     if args.debugmode:
-        process_main(rank=0, fname=args.fname, world_size=1, devices=["cuda:0"])
+        process_main(rank=0, fname=args.fname, world_size=1, devices=["cuda:0"], port=0)
     else:
         num_gpus = len(args.devices)
+        port = _find_free_port()
         mp.set_start_method("spawn")
         procs = []
         for rank in range(num_gpus):
-            proc = mp.Process(target=process_main, args=(rank, args.fname, num_gpus, args.devices))
+            proc = mp.Process(target=process_main, args=(rank, args.fname, num_gpus, args.devices, port))
             proc.start()
             procs.append(proc)
 

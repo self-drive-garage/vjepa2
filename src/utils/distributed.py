@@ -67,6 +67,13 @@ def init_distributed(port=37129, rank_and_world_size=(None, None)):
             os.environ["MASTER_PORT"] = str(port)
         torch.distributed.init_process_group(backend=backend, world_size=world_size, rank=rank)
     except Exception as e:
+        if world_size > 1:
+            # Multi-GPU: crash loudly instead of silently falling back to single-process,
+            # which would create a split-brain (rank 0 alone while ranks 1-N wait).
+            raise RuntimeError(
+                f"Rank {rank}: Failed to init distributed (world_size={world_size}, "
+                f"port={os.environ.get('MASTER_PORT', '?')}, {backend=}): {e}"
+            ) from e
         world_size, rank = 1, 0
         logger.info(f"Rank: {rank}. Distributed training not available ({backend=}): {e}")
 

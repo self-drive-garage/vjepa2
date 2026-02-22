@@ -96,6 +96,7 @@ class OptimizationConfig:
     betas: tuple[float, float]
     eps: float
     encoder_lr_scale: float
+    gradient_accumulation_steps: int
 
 
 @dataclass(frozen=True)
@@ -213,6 +214,7 @@ def parse_train_sections(args: dict, resume_preempt: bool = False) -> TrainSecti
         betas=tuple(cfgs_opt.get("betas", (0.9, 0.999))),
         eps=float(cfgs_opt.get("eps", 1.0e-8)),
         encoder_lr_scale=float(cfgs_opt.get("encoder_lr_scale", 0.1)),
+        gradient_accumulation_steps=max(1, int(cfgs_opt.get("gradient_accumulation_steps", 1))),
     )
 
     return TrainSections(
